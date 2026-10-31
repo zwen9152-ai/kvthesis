@@ -4,7 +4,15 @@ Reads result files of ``eval.run_eval --save_ids`` (one or more; runs are matche
 problem id within a file) and writes to ``--out``:
 
   summary.md / summary.tex   per run: accuracy, mean output length, peak KV entries,
-                             truncation and loop rates, output-length inflation vs full KV
+                             truncation rate, repeated-step flag rate (the online detector
+                             fired on the trace), duplicate-step token share, "Wait" rate,
+                             terminal verbatim loops, output-length inflation vs full KV
+
+Note on terms (phase-1b finding): eviction rarely produces verbatim cycling; the typical
+failure is non-convergence -- more re-verification ("Wait"), duplicated reasoning steps,
+longer output and truncation. ``loop`` below means "contains a repeated reasoning step /
+periodic span" (the detector's trigger), ``term`` a truncated trace whose last 1024
+tokens have < 30% distinct 8-grams (verbatim cycling until the limit).
   loss.md                    problems full KV solves but the run misses, split into
                              loop / truncated without loop / other wrong answer
   paired.md                  each rollback / rescue variant vs its base run on the same
@@ -76,6 +84,39 @@ def loop_onset(gen_ids, delim, budget, buffer=128):
     return None
 
 
+def step_split(gen_ids, delim):
+    out, cur = [], []
+    for t in gen_ids:
+        cur.append(t)
+        if t in delim:
+            out.append(tuple(cur))
+            cur = []
+    if cur:
+        out.append(tuple(cur))
+    return out
+
+
+def dup_step_share(gen_ids, delim, min_len=8):
+    """Share of tokens (in steps of >= min_len tokens) that repeat an earlier step verbatim."""
+    seen, dup, tot = set(), 0, 0
+    for st in step_split(gen_ids, delim):
+        if len(st) < min_len:
+            continue
+        tot += len(st)
+        dup += len(st) if st in seen else 0
+        seen.add(st)
+    return dup / max(1, tot)
+
+
+def terminal_loop(r, tail=1024, n=8, thr=0.3):
+    g = r.get("gen_ids") or []
+    if r["finished"] or len(g) < tail:
+        return False
+    t = g[-tail:]
+    grams = [tuple(t[i: i + n]) for i in range(len(t) - n + 1)]
+    return len(set(grams)) / len(grams) < thr
+
+
 def mcnemar_p(wins: int, losses: int) -> float:
     """Exact two-sided McNemar test on the discordant pairs."""
     n = wins + losses
@@ -114,7 +155,12 @@ def main():
     from transformers import AutoTokenizer
 
     from kvcomp.segment import delimiter_token_ids
-    delim = set(delimiter_token_ids(AutoTokenizer.from_pretrained(args.tokenizer)))
+    tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    delim = set(delimiter_token_ids(tok))
+
+    def wait_rate(r):
+        g = r.get("gen_ids") or []
+        return 1000 * tok.decode(g).count("Wait") / max(1, len(g))
 
     runs = load(args.runs)
     full = runs.get("full", {})
@@ -135,12 +181,17 @@ def main():
             "trunc": mean(not r["finished"] for r in rs.values()),
             "loop": mean(r["degenerate"] for r in rs.values()),
             "inflation": infl,
+            "dup": mean(dup_step_share(r.get("gen_ids") or [], delim) for r in rs.values()),
+            "wait": mean(wait_rate(r) for r in rs.values()),
+            "term": mean(terminal_loop(r) for r in rs.values()),
             "rb": mean(len(r.get("rollbacks", [])) for r in rs.values()),
         })
-    hdr = "| run | n | acc | len | computed | peak KV | trunc | loop | len/full | rb/prob |\n|---|---|---|---|---|---|---|---|---|---|\n"
+    hdr = ("| run | n | acc | len | computed | peak KV | trunc | loop | term | dup-step | Wait/1k | len/full | rb/prob |\n"
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
     md = hdr + "".join(
         f"| `{r['run']}` | {r['n']} | {r['acc']:.1%} | {r['len']:.0f} | {r['computed']:.0f} | {r['peak_kv']:.0f} | "
-        f"{r['trunc']:.1%} | {r['loop']:.1%} | {r['inflation']:.2f} | {r['rb']:.2f} |\n" for r in rows)
+        f"{r['trunc']:.1%} | {r['loop']:.1%} | {r['term']:.1%} | {r['dup']:.1%} | {r['wait']:.1f} | "
+        f"{r['inflation']:.2f} | {r['rb']:.2f} |\n" for r in rows)
     open(os.path.join(args.out, "summary.md"), "w").write(md)
     tex = ["\\begin{tabular}{lrrrrrr}", "\\toprule",
            "Method & Budget & Acc. & Len. & Peak KV & Trunc. & Loop \\\\", "\\midrule"]
