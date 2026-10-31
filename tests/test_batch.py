@@ -97,3 +97,64 @@ def test_batch_sampling_matches_single(model):
         delimiter_ids=DELIM, batch_size=3, max_new_tokens=100, temperature=1.0, top_p=0.9,
         seeds=[10 + i for i in range(len(ps))], window=8))
     assert [res[i]["gen_ids"] for i in range(len(ps))] == [s["gen_ids"] for s in single]
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_lazy_batched_is_order_independent(model, rollback):
+    """LazyEviction runs only batched; batch 1 and batch 3 must agree token for token."""
+    ps = prompts()
+
+    def run(bs):
+        def make_comp(capture):
+            return KVCompressor(model, "lazy", budget=32, buffer=8, window=8, offload=rollback, capture=capture)
+        make_det = (lambda: DegenerationDetector(min_span=24, max_period=16, check_every=4)) if rollback else None
+        res = dict(generate_batch(model, ps, make_compressor=make_comp, make_detector=make_det, delimiter_ids=DELIM,
+                                  batch_size=bs, max_new_tokens=200, temperature=0.0, refeed=8, window=8,
+                                  observe_alpha=0.05))
+        return [res[i] for i in range(len(ps))]
+
+    one, three = run(1), run(3)
+    assert [r["gen_ids"] for r in one] == [r["gen_ids"] for r in three]
+    assert all(r["n_compress"] > 0 for r in one)
+    assert all(r["max_cache_len"] <= p.shape[1] + 40 for r, p in zip(one, ps))
+
+
+def test_lazy_observer_tracks_recurrence(model):
+    """Observer state must equal a brute-force replay of the official TempCache rule."""
+    ps = prompts(1)
+    import copy
+    model = copy.deepcopy(model)
+    for layer in model.model.layers:  # sharpen the near-uniform random attention so gaps occur
+        layer.self_attn.q_proj.weight.data *= 8
+    alpha, n_new = 0.05, 40
+    dbg = {}
+    res = dict(generate_batch(
+        model, ps, make_compressor=lambda c: KVCompressor(model, "lazy", budget=1000, buffer=8, window=8, capture=c),
+        delimiter_ids=DELIM, batch_size=1, max_new_tokens=n_new, temperature=0.0, window=8,
+        observe_alpha=alpha, debug=dbg))
+    assert res[0]["n_compress"] == 0  # budget 1000: nothing evicted, so positions == indices
+    ids = torch.tensor([ps[0][0].tolist() + res[0]["gen_ids"]])
+    P, T = ps[0].shape[1], ids.shape[1]
+    eager = Qwen2ForCausalLM(model.config).eval()
+    eager.load_state_dict(model.state_dict())
+    eager.config._attn_implementation = "eager"
+    with torch.no_grad():
+        attn = eager(ids, output_attentions=True).attentions  # per layer (1, Hq, T, T)
+    hkv = model.config.num_key_value_heads
+    slots = dbg["slots"]
+    gaps = []
+    for li in range(model.config.num_hidden_layers):
+        a = attn[li][0].reshape(hkv, -1, T, T).amax(1)  # any query head of the group
+        last = torch.zeros(hkv, T)
+        mp = torch.zeros(hkv, T)
+        for step in range(1, n_new + 1):
+            q = P + step - 1  # the token decoded at this step
+            last[:, q] = step - 1
+            hit = a[:, q, : q + 1] >= alpha
+            new_last = torch.where(hit, torch.tensor(float(step)), last[:, : q + 1])
+            mp[:, : q + 1] = torch.maximum(mp[:, : q + 1], new_last - last[:, : q + 1])
+            last[:, : q + 1] = new_last
+        torch.testing.assert_close(slots.last[li][0, :, :T], last)
+        torch.testing.assert_close(slots.mp[li][0, :, :T], mp)
+        gaps.append(float(mp.max()))
+    assert max(gaps) > 1  # some token was re-attended after a gap

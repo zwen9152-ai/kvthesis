@@ -39,6 +39,15 @@ class SlotCache:
         self.lens = [0] * batch
         self.write_at: torch.Tensor | None = None  # (B,) slot lengths during a decode step
         self.span = 0  # number of entries visible to the current step
+        # optional per-step attention observer (LazyEviction): last re-attended step and
+        # maximum recurrence interval of every entry, aligned with k/v
+        self.obs_alpha: float | None = None
+        self.obs_query = None  # layer -> (B, Hq, D) query of the token being decoded
+        self.obs_scaling = 1.0
+        self.obs_step: torch.Tensor | None = None  # (B,) decoding step of every slot
+        self.obs_live: torch.Tensor | None = None  # (B,) slots that decode this step
+        self.last: list[torch.Tensor | None] = [None] * n_layers
+        self.mp: list[torch.Tensor | None] = [None] * n_layers
 
     def _alloc(self, like: torch.Tensor):
         _, h, _, d = like.shape
@@ -46,6 +55,9 @@ class SlotCache:
             if self.k[i] is None:
                 self.k[i] = like.new_zeros(self.batch, h, self.capacity, d)
                 self.v[i] = like.new_zeros(self.batch, h, self.capacity, d)
+                if self.obs_alpha is not None:
+                    self.last[i] = torch.zeros(self.batch, h, self.capacity, device=like.device)
+                    self.mp[i] = torch.zeros(self.batch, h, self.capacity, device=like.device)
 
     def ensure(self, need: int):
         """Grow every buffer to hold at least ``need`` entries per slot."""
@@ -57,6 +69,10 @@ class SlotCache:
                 pad = self.k[i].new_zeros(*self.k[i].shape[:2], grow, self.k[i].shape[-1])
                 self.k[i] = torch.cat([self.k[i], pad], 2)
                 self.v[i] = torch.cat([self.v[i], pad.clone()], 2)
+                if self.last[i] is not None:
+                    z = self.last[i].new_zeros(*self.last[i].shape[:2], grow)
+                    self.last[i] = torch.cat([self.last[i], z], 2)
+                    self.mp[i] = torch.cat([self.mp[i], z.clone()], 2)
         self.capacity += grow
 
     # --- HF Cache protocol (decode step only) ---
@@ -64,7 +80,28 @@ class SlotCache:
         rows = torch.arange(self.batch, device=key_states.device)
         self.k[layer_idx][rows, :, self.write_at] = key_states[:, :, 0]
         self.v[layer_idx][rows, :, self.write_at] = value_states[:, :, 0]
-        return self.k[layer_idx][:, :, : self.span], self.v[layer_idx][:, :, : self.span]
+        keys = self.k[layer_idx][:, :, : self.span]
+        if self.obs_alpha is not None:
+            self._observe(layer_idx, keys, rows)
+        return keys, self.v[layer_idx][:, :, : self.span]
+
+    def _observe(self, i: int, keys: torch.Tensor, rows: torch.Tensor):
+        """Record which entries the current token re-attends to (LazyEviction recurrence tracking)."""
+        q = self.obs_query(i)  # (B, Hq, D)
+        b, hkv, span, d = keys.shape
+        qg = q.float().reshape(b, hkv, -1, d)  # GQA groups
+        logits = torch.matmul(qg, keys.float().transpose(-1, -2)) * self.obs_scaling  # (B, Hkv, rep, span)
+        valid = torch.arange(span, device=keys.device)[None, :] <= self.write_at[:, None]  # (B, span)
+        probs = logits.masked_fill(~valid[:, None, None, :], float("-inf")).softmax(-1).amax(2)
+        step = self.obs_step[:, None, None]
+        last, mp = self.last[i][:, :, :span], self.mp[i][:, :, :span]
+        # a new entry starts as "last seen one step ago" (official TempCache padding)
+        last[rows, :, self.write_at] = (self.obs_step - 1)[:, None].expand(-1, hkv)
+        mp[rows, :, self.write_at] = 0
+        hit = (probs >= self.obs_alpha) & valid[:, None, :] & self.obs_live[:, None, None]
+        new_last = torch.where(hit, step, last)
+        torch.maximum(mp, new_last - last, out=mp)
+        last.copy_(new_last)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return self.span
@@ -130,7 +167,7 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                    batch_size: int = 16, max_new_tokens: int = 4096, temperature: float = 0.0,
                    top_p: float = 1.0, eos_ids=(), seeds=None, max_rollbacks: int = 4, refeed: int = 16,
                    max_rewind: int = 512, recall: bool = True, escalate: float = 1.0, max_budget: int = 4096,
-                   window: int = 16):
+                   window: int = 16, observe_alpha: float | None = None, debug: dict | None = None):
     """Decode every prompt in ``prompts`` (each (1, P)) and yield ``(index, result)`` as each finishes.
 
     ``make_compressor(capture)`` / ``make_detector()`` build fresh per-problem objects
@@ -147,6 +184,13 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
     shared = QueryCapture(model, window) if make_compressor is not None else None
     cap0 = max(p.shape[1] for p in prompts) + 1024
     slots = SlotCache(n_layers, B, cap0)
+    if debug is not None:
+        debug["slots"] = slots
+    if observe_alpha is not None:
+        slots.obs_alpha = observe_alpha
+        slots.obs_query = lambda i: shared.buf[i][:, :, -1]
+        slots.obs_scaling = model.model.layers[0].self_attn.scaling
+        slots.obs_step = torch.zeros(B, device=device)
     seqs: list[_Seq | None] = [None] * B
     queue = list(range(len(prompts)))
 
@@ -184,6 +228,11 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         if comp is not None:
             comp.on_prefill(cache, s.P)
         slots.from_dynamic(b, cache)
+        if observe_alpha is not None:  # official: counters restart at prefill, state starts at zero
+            slots.obs_step[b] = 0
+            for i in range(n_layers):
+                slots.last[i][b] = 0
+                slots.mp[i][b] = 0
         s.max_cache = s.P
         s.logits = out.logits[0, -1]
         seqs[b] = s
@@ -208,6 +257,28 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         seqs[b] = None
         return s.idx, res
 
+    def lazy_to_state(b, s):
+        """Hand the observer's per-entry history of slot ``b`` to its compressor (decoded part only)."""
+        if observe_alpha is None:
+            return
+        n = slots.lens[b]
+        for i in range(n_layers):
+            st = s.compressor.state[i]
+            st["lazy_last"] = slots.last[i][b: b + 1, :, s.P:n].clone()
+            st["lazy_mp"] = slots.mp[i][b: b + 1, :, s.P:n].clone()
+            st["lazy_step"] = float(slots.obs_step[b])
+
+    def lazy_from_state(b, s):
+        """Write the (re-selected) history back next to the entries it belongs to."""
+        if observe_alpha is None:
+            return
+        n = slots.lens[b]
+        for i in range(n_layers):
+            st = s.compressor.state[i]
+            if "lazy_last" in st and st["lazy_last"].shape[-1] == n - s.P:
+                slots.last[i][b, :, s.P:n] = st["lazy_last"][0]
+                slots.mp[i][b, :, s.P:n] = st["lazy_mp"][0]
+
     def after_token(b, s, tok, pos, at_boundary):
         """Compression / detection / rollback for slot ``b`` once ``tok`` is cached (cf. decode.generate)."""
         comp, det = s.compressor, s.detector
@@ -215,8 +286,10 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             comp.append([pos])
             if comp.due(at_boundary):
                 cache = slots.to_dynamic(b)
+                lazy_to_state(b, s)
                 comp.compress(cache, s.tracker.steps)
                 slots.from_dynamic(b, cache)
+                lazy_from_state(b, s)
                 if comp.offload:
                     s.max_offload = max(s.max_offload, comp.offloaded_bytes())
         s.max_cache = max(s.max_cache, slots.lens[b])
@@ -241,8 +314,16 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         s.rollbacks[-1]["budget"] = comp.budget
         out = single_forward(b, cache, s.generated[c0 - P:], c0)
         s.rollbacks[-1]["transient_cache_len"] = get_kv(cache, 0)[0].shape[-2]
-        comp.on_tokens(cache, list(range(c0, cut)), s.tracker.steps, at_boundary=True)
+        comp.append(list(range(c0, cut)))
+        if observe_alpha is not None:  # recalled entries have no history: restart them as just seen
+            for i in range(n_layers):
+                comp.state[i]["lazy_last"] = torch.full(comp.pos[i].shape, float(slots.obs_step[b]), device=device)
+                comp.state[i]["lazy_mp"] = torch.zeros(comp.pos[i].shape, device=device)
+                comp.state[i]["lazy_step"] = float(slots.obs_step[b])
+        if comp.due(at_boundary=True):
+            comp.compress(cache, s.tracker.steps)
         slots.from_dynamic(b, cache)
+        lazy_from_state(b, s)
         s.max_cache = max(s.max_cache, slots.lens[b])
         s.logits = out.logits[0, -1]
 
@@ -289,6 +370,11 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         mask = torch.arange(slots.span, device=device)[None, :] <= lens[:, None]  # (B, span)
         pos = [seqs[b].P + len(seqs[b].generated) - 1 if step_tok[b] is not None else 0 for b in range(B)]
         ids = torch.tensor([[t if t is not None else 0] for t in step_tok], device=device)
+        if observe_alpha is not None:
+            live_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            live_mask[live] = True
+            slots.obs_step += live_mask.float()
+            slots.obs_live = live_mask
         prev_buf = dict(shared.buf) if shared is not None else None
         out = model(input_ids=ids, past_key_values=slots, use_cache=True,
                     position_ids=torch.tensor(pos, device=device)[:, None],

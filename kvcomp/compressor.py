@@ -49,6 +49,7 @@ class KVCompressor:
         self.store: list = []  # per layer (pos, keys, values) evicted to CPU, or None
         self.n_compress = 0
         self.n_recalled = 0
+        self.rng = None  # stochastic methods: re-seeded per problem, created on the cache device
 
     def close(self):
         if self.own_capture:
@@ -92,8 +93,10 @@ class KVCompressor:
             kd, vd = k[:, :, P:], v[:, :, P:]
             scores = window_attention(self.capture.buf[i], k, self.modules[i].scaling)[..., P:]
             pos = self.pos[i]
+            if self.rng is None:
+                self.rng = torch.Generator(device=k.device).manual_seed(int(self.cfg.get("seed", 0)))
             ctx = SelectCtx(scores=scores, keys=kd, steps=steps_fn(pos), budget=self.budget,
-                            recent=self.window, state=self.state[i], cfg=self.cfg)
+                            recent=self.window, state=self.state[i], cfg=self.cfg, values=vd, rng=self.rng)
             idx = self.select(ctx)
             if self.offload:
                 self._offload(i, kd, vd, pos, idx)

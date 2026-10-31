@@ -53,7 +53,7 @@ def test_window_attention_matches_eager(model, prompt):
         torch.testing.assert_close(ours, ref, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("method", sorted(METHODS))
+@pytest.mark.parametrize("method", sorted(set(METHODS) - {"lazy"}))  # lazy: batched decoder only
 @pytest.mark.parametrize("step_trigger", [False, True])
 def test_methods_respect_budget(model, prompt, method, step_trigger):
     budget, buffer = 32, 16
@@ -187,3 +187,33 @@ def test_rollback_escalates_budget(model, prompt):
     comp.reset()
     comp.close()
     assert comp.budget == 32
+
+
+def test_lazy_score_matches_official_formula():
+    from kvcomp.methods import SelectCtx, select_lazy
+    torch.manual_seed(0)
+    last = torch.randint(0, 50, (1, 2, 40)).float()
+    mp = torch.randint(0, 6, (1, 2, 40)).float()
+    ctx = SelectCtx(scores=torch.rand(1, 2, 40), keys=torch.randn(1, 2, 40, 4), steps=torch.zeros(1, 2, 40),
+                    budget=20, recent=4, state={"lazy_last": last, "lazy_mp": mp, "lazy_step": 50.0})
+    idx = select_lazy(ctx)
+    # official Window_LAZYKVCluster.update_kv_in_decoding
+    s = torch.where(mp == 0, torch.tensor(0.0), 2 / (1 + torch.exp((mp - 1))))
+    imp = 2 / (1 + torch.exp(1 + (50 - last) / (mp + 1e-5))) + s
+    top = imp[..., :-4].topk(16, dim=-1).indices
+    ref = torch.cat([top, torch.arange(36, 40).expand(1, 2, 4)], -1).sort(-1).values
+    assert torch.equal(idx, ref)
+
+
+def test_vase_keeps_large_values_and_recent():
+    from kvcomp.methods import SelectCtx, select_vase
+    torch.manual_seed(0)
+    vals = torch.randn(1, 2, 40, 8)
+    vals[:, :, 5] *= 50  # an outlier value state
+    ctx = SelectCtx(scores=torch.rand(1, 2, 40), keys=torch.randn(1, 2, 40, 8), steps=torch.zeros(1, 2, 40),
+                    budget=20, recent=4, state={}, values=vals, rng=torch.Generator().manual_seed(0))
+    idx = select_vase(ctx)
+    assert idx.shape == (1, 2, 20)
+    for h in range(2):
+        kept = set(idx[0, h].tolist())
+        assert len(kept) == 20 and 5 in kept and {36, 37, 38, 39} <= kept

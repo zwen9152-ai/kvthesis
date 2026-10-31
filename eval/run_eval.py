@@ -161,8 +161,14 @@ def main():
         for budget in ([None] if name == "full" else budgets):
             run = run_key(spec, budget)
             comp_opts, det_opts, rb_opts = None, None, {}
+            observe_alpha = None
             if name != "full":
                 comp_opts = dict(cfg)
+                if name == "lazy":  # official schedule: evict every W steps, W ~ 0.117 x capacity (MATH)
+                    w = int(comp_opts.pop("obs", max(8, round(0.117 * budget))))
+                    comp_opts.setdefault("buffer", w)
+                    comp_opts.setdefault("window", w)
+                    observe_alpha = float(comp_opts.pop("alpha", 1e-4))
                 comp_opts.setdefault("buffer", args.buffer)
                 comp_opts.setdefault("window", args.window)
                 if comp_opts.pop("rollback", 0):
@@ -183,12 +189,14 @@ def main():
             common = dict(delimiter_ids=delim, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
                           top_p=args.top_p, eos_ids=eos, **rb_opts)
 
-            if args.batch_size > 1:
+            if args.batch_size > 1 or observe_alpha is not None:
                 make_comp = None if comp_opts is None else (
                     lambda capture: KVCompressor(model, name, budget, capture=capture, **comp_opts))
                 make_det = None if det_opts is None else (lambda: DegenerationDetector(**det_opts))
                 results = generate_batch(model, prompts, make_compressor=make_comp, make_detector=make_det,
-                                         batch_size=args.batch_size, window=args.window,
+                                         batch_size=args.batch_size,
+                                         window=comp_opts["window"] if comp_opts else args.window,
+                                         observe_alpha=observe_alpha,
                                          seeds=[args.seed + i for i, _ in todo], **common)
                 for j, res in results:
                     i, prob = todo[j]

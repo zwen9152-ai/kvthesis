@@ -23,6 +23,8 @@ class SelectCtx:
     recent: int  # most recent entries that are always kept
     state: dict  # per-layer mutable state, gathered along with the cache
     cfg: dict = field(default_factory=dict)
+    values: torch.Tensor | None = None  # (B, H, T, D) decoded values (value-aware methods)
+    rng: torch.Generator | None = None  # for stochastic methods
 
 
 def _force_recent(score: torch.Tensor, recent: int) -> torch.Tensor:
@@ -132,10 +134,59 @@ def select_stepkv(ctx: SelectCtx) -> torch.Tensor:
     return _topk(_force_recent(adjusted, ctx.recent), ctx.budget)
 
 
+def select_lazy(ctx: SelectCtx) -> torch.Tensor:
+    """LazyEviction (Zhang et al., ACL 2026; port of the official ``Window_LAZYKVCluster``).
+
+    A token is "re-attended" at a decoding step when its attention weight reaches
+    ``alpha``. Per token the batched decoder tracks the last such step and the maximum
+    recurrence interval (MRI) between two of them; the score keeps tokens whose next
+    recurrence is due soon. Needs per-step attention, so it only runs in
+    ``kvcomp.batch.generate_batch`` (which fills ``lazy_last``/``lazy_mp``/``lazy_step``).
+    Adaptation: official code evicts per query head (KV repeated); we share one decision
+    per KV head and mark a token re-attended if any query head of its group attends to it.
+    """
+    try:
+        last, mp, step = ctx.state["lazy_last"], ctx.state["lazy_mp"], ctx.state["lazy_step"]
+    except KeyError as e:
+        raise RuntimeError("lazy needs the per-step observer of kvcomp.batch.generate_batch") from e
+    s = torch.where(mp == 0, torch.zeros_like(mp), 2 / (1 + torch.exp(mp - 1)))
+    score = 2 / (1 + torch.exp(1 + (step - last) / (mp + 1e-5))) + s
+    return _topk(_force_recent(score, ctx.recent), ctx.budget)
+
+
+def select_vase(ctx: SelectCtx) -> torch.Tensor:
+    """VaSE-AttnV (arXiv 2606.03928; official mode ``range_sink_sample_attn``).
+
+    Of the non-recent candidates, the ``n_large`` (default a quarter of the free slots)
+    with the largest value range max(v) - min(v) are kept unconditionally; the remaining
+    slots are drawn without replacement with probability proportional to the
+    average-pooled window attention. The prompt (incl. sink tokens) is never evicted here.
+    """
+    if ctx.values is None:
+        raise RuntimeError("vase needs the decoded values")
+    t = ctx.scores.shape[-1]
+    n_cand = t - ctx.recent
+    k = ctx.budget - ctx.recent
+    n_large = min(ctx.cfg.get("n_large", k // 4), k)
+    vmag = (ctx.values.amax(-1) - ctx.values.amin(-1)).float()[..., :n_cand]
+    ids_large = vmag.topk(n_large, dim=-1).indices
+    kernel = ctx.cfg.get("pool", 5)
+    b, h, _ = ctx.scores.shape
+    w = F.avg_pool1d(ctx.scores.reshape(b * h, 1, t), kernel, stride=1, padding=kernel // 2,
+                     count_include_pad=False).reshape(b, h, t)[..., :n_cand].clamp_min(1e-12)
+    w = w.scatter(-1, ids_large, 0.0)
+    ids_sample = torch.multinomial(w.reshape(b * h, n_cand), k - n_large, replacement=False,
+                                   generator=ctx.rng).reshape(b, h, -1)
+    recent = torch.arange(n_cand, t, device=w.device).expand(b, h, -1)
+    return torch.cat([ids_large, ids_sample, recent], dim=-1).sort(dim=-1).values
+
+
 METHODS = {
     "streaming": select_streaming,
     "snapkv": select_snapkv,
     "h2o": select_h2o,
     "rkv": select_rkv,
     "stepkv": select_stepkv,
+    "lazy": select_lazy,
+    "vase": select_vase,
 }
