@@ -153,8 +153,9 @@ def main():
                 if args.save_ids:
                     rec["prompt_ids"] = ids[0].tolist()
                     rec["gen_ids"] = res["gen_ids"]
-                with open(args.out, "a") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                # one unbuffered O_APPEND write per line, so parallel workers never interleave
+                with open(args.out, "ab", buffering=0) as f:
+                    f.write((json.dumps(rec, ensure_ascii=False) + "\n").encode())
                 done.add((run, prob["id"]))
                 print(f"[{run}] {i + 1}/{len(problems)} {prob['id']} correct={rec['correct']} "
                       f"len={res['num_tokens']} maxKV={res['max_cache_len']} {res['tok_per_s']:.1f} tok/s",
