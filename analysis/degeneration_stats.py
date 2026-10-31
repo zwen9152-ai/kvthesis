@@ -64,8 +64,10 @@ def mean(xs):
 def loop_onset(gen_ids, delim, budget, buffer=128):
     """(tokens from the first eviction to the first detected loop, loop period) or None."""
     det = DegenerationDetector()
-    for i in range(len(gen_ids)):
-        start = det.update(gen_ids[: i + 1], gen_ids[i] in delim)
+    seen: list[int] = []
+    for i, t in enumerate(gen_ids):
+        seen.append(t)
+        start = det.update(seen, t in delim)
         if start is not None:
             tail = gen_ids[start: i + 1]
             period = next((p for p in range(1, 65) if len(tail) >= 2 * p and tail[-p:] == tail[-2 * p: -p]), None)

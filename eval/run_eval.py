@@ -79,7 +79,12 @@ def run_key(spec: str, budget: int | None) -> str:
 def has_loop(gen_ids, delim) -> bool:
     """Post-hoc degeneration flag: does the finished trace contain a repetition loop?"""
     det = DegenerationDetector()
-    return any(det.update(gen_ids[: i + 1], t in delim) is not None for i, t in enumerate(gen_ids))
+    seen: list[int] = []  # grown in place: slicing a prefix per token would be O(n^2)
+    for t in gen_ids:
+        seen.append(t)
+        if det.update(seen, t in delim) is not None:
+            return True
+    return False
 
 
 def summarize(path: str):
