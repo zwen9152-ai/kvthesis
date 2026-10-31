@@ -24,7 +24,7 @@ import torch
 from transformers import DynamicCache
 
 from .cache_utils import get_kv, num_layers
-from .decode import _forward, sample_next
+from .decode import _forward, sample_rows
 from .query_capture import QueryCapture
 from .segment import StepTracker
 
@@ -357,21 +357,19 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             start(b)
 
     while any(s is not None for s in seqs):
-        # 1. sample for every live slot; retire finished ones and refill their slot
+        # 1. retire finished slots and refill them; then sample every slot with pending logits
         step_tok = [None] * B
         for b in range(B):
-            s = seqs[b]
-            if s is None:
-                continue
-            while s is not None and (s.done or len(s.generated) >= max_new_tokens):
+            while seqs[b] is not None and (seqs[b].done or len(seqs[b].generated) >= max_new_tokens):
                 yield finish(b)
-                s = None
                 if queue:
                     start(b)
-                    s = seqs[b]
-            if s is None or s.logits is None:
-                continue
-            tok = sample_next(s.logits, temperature, top_p, s.generator)
+        ready = [b for b in range(B) if seqs[b] is not None and seqs[b].logits is not None]
+        if ready:
+            toks = sample_rows(torch.stack([seqs[b].logits for b in ready]), temperature, top_p,
+                               [seqs[b].generator for b in ready])
+        for b, tok in zip(ready, toks if ready else []):
+            s = seqs[b]
             s.logits = None
             s.generated.append(tok)
             s.computed += 1

@@ -47,7 +47,8 @@ class KVCompressor:
         self.capture.reset()
         self.budget = self.base_budget  # rollback may have escalated it
         self.prompt_len = 0
-        self.pos: list[torch.Tensor] = []  # per layer (B, H, T_decoded) absolute positions
+        self._pos: list[torch.Tensor] = []  # per layer (B, H, T_decoded) absolute positions
+        self._pending: list[int] = []  # positions appended since the last flush (same for all layers)
         self.state: list[dict] = []
         self.store: list = []  # per layer (pos, keys, values) evicted to CPU, or None
         self.n_compress = 0
@@ -69,7 +70,8 @@ class KVCompressor:
         b, h = k.shape[:2]
         empty = torch.empty(b, h, 0, dtype=torch.long, device=k.device)
         n = num_layers(cache)
-        self.pos = [empty for _ in range(n)]
+        self._pos = [empty for _ in range(n)]
+        self._pending = []
         self.state = [{} for _ in range(n)]
         self.store = [None] * n
 
@@ -81,14 +83,29 @@ class KVCompressor:
         self.compress(cache, steps_fn)
         return True
 
+    @property
+    def pos(self) -> list[torch.Tensor]:
+        """Per-layer kept positions; pending appends are materialised on first access."""
+        if self._pending:
+            new = torch.tensor(self._pending, device=self._pos[0].device)
+            self._pos = [torch.cat([p, new.expand(*p.shape[:2], -1)], dim=-1) for p in self._pos]
+            self._pending = []
+        return self._pos
+
+    @pos.setter
+    def pos(self, value):
+        self._pos, self._pending = value, []
+
     def append(self, positions: list[int]) -> None:
-        new = torch.tensor(positions, device=self.pos[0].device)
-        for i, p in enumerate(self.pos):
-            self.pos[i] = torch.cat([p, new.expand(*p.shape[:2], -1)], dim=-1)
+        """Register newly cached positions (cheap: kept in a Python list until needed)."""
+        self._pending.extend(positions)
+
+    def n_decoded(self) -> int:
+        return (self._pos[0].shape[-1] if self._pos else 0) + len(self._pending)
 
     def due(self, at_boundary: bool) -> bool:
         """Whether the schedule asks for a compression now (``append`` already called)."""
-        n = self.pos[0].shape[-1]
+        n = self.n_decoded()
         if n < self.budget + self.buffer:
             return False
         return not (self.step_trigger and not at_boundary and n < self.budget + 2 * self.buffer)

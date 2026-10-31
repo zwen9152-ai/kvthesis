@@ -21,38 +21,57 @@ def delimiter_token_ids(tokenizer, delimiters=DEFAULT_DELIMITERS) -> set[int]:
 
 
 class StepTracker:
-    """Assigns a step id to every absolute position. Prompt positions get step 0."""
+    """Assigns a step id to every absolute position. Prompt positions get step 0.
+
+    Step ids live in a Python list (one append per decoded token, no GPU work); the
+    device copy needed by ``steps`` is rebuilt only when it is stale, i.e. at most once
+    per compression.
+    """
 
     def __init__(self, delimiter_ids: set[int], max_len: int, device):
         self.delimiter_ids = delimiter_ids
-        self.step_of_pos = torch.zeros(max_len, dtype=torch.long, device=device)
+        self.device = device
+        self.ids: list[int] = []
         self.cur_step = 1
-        self.len = 0
         self.boundary = False  # True right after a step was closed
+        self._dev = None  # cached device tensor of ``ids``
+        self._dev_len = -1
+        self._version = 0
+        self._dev_version = -1
+
+    @property
+    def len(self) -> int:
+        return len(self.ids)
 
     def add_prompt(self, n: int):
-        self.len = n
+        self.ids = [0] * n
+        self._version += 1
 
     def add_token(self, token_id: int) -> bool:
-        self.step_of_pos[self.len] = self.cur_step
-        self.len += 1
+        self.ids.append(self.cur_step)
         self.boundary = token_id in self.delimiter_ids
         if self.boundary:
             self.cur_step += 1
         return self.boundary
 
     def steps(self, pos: torch.Tensor) -> torch.Tensor:
-        return self.step_of_pos[pos]
+        if self._dev is None or self._dev_len != len(self.ids) or self._dev_version != self._version:
+            self._dev = torch.tensor(self.ids, dtype=torch.long, device=pos.device)
+            self._dev_len, self._dev_version = len(self.ids), self._version
+        return self._dev[pos]
 
     def step_start(self, pos: int) -> int:
         """First absolute position of the step that contains ``pos``."""
-        same = (self.step_of_pos[: pos + 1] == self.step_of_pos[pos]).nonzero()
-        return int(same[0])
+        s, i = self.ids[pos], pos
+        while i > 0 and self.ids[i - 1] == s:
+            i -= 1
+        return i
 
     def truncate(self, length: int, tokens: list[int]) -> None:
         """Forget every position >= length (``tokens`` = generated tokens kept)."""
-        self.len = length
-        self.cur_step = (int(self.step_of_pos[length - 1]) if tokens else 0) + 1
+        del self.ids[length:]
+        self._version += 1
+        self.cur_step = (self.ids[length - 1] if tokens else 0) + 1
         if tokens and tokens[-1] not in self.delimiter_ids:
             self.cur_step -= 1
         self.boundary = False

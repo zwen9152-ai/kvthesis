@@ -33,6 +33,25 @@ def sample_next(logits: torch.Tensor, temperature: float, top_p: float, generato
     return int(torch.multinomial(probs, 1, generator=generator))
 
 
+def sample_rows(logits: torch.Tensor, temperature: float, top_p: float, generators) -> list[int]:
+    """``sample_next`` for every row of ``logits`` (n, V) with one generator per row.
+
+    Softmax, sorting and the top-p filter run batched; only the draw is per row (so each
+    problem keeps its own random stream), and the results come back in one transfer.
+    Row by row the result equals ``sample_next``.
+    """
+    if temperature <= 0:
+        return logits.argmax(-1).tolist()
+    probs = (logits.float() / temperature).softmax(-1)
+    if top_p < 1.0:
+        sorted_p, sorted_i = probs.sort(dim=-1, descending=True)
+        drop = sorted_p.cumsum(-1) - sorted_p > top_p
+        sorted_p[drop] = 0
+        probs = torch.zeros_like(probs).scatter_(-1, sorted_i, sorted_p)
+    draws = [torch.multinomial(probs[r], 1, generator=g) for r, g in enumerate(generators)]
+    return torch.cat(draws).tolist()
+
+
 def _forward(model, cache, tokens: list[int], start_pos: int):
     device = model.device
     n, clen = len(tokens), cache_len(cache)
