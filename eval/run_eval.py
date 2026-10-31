@@ -25,6 +25,7 @@ from eval import data
 from eval.grader import extract_answer, is_equiv
 from kvcomp import KVCompressor, generate
 from kvcomp.batch import generate_batch
+from kvcomp.rescue import HelperState
 from kvcomp.degeneration import DegenerationDetector
 from kvcomp.segment import delimiter_token_ids
 
@@ -117,12 +118,17 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--save_ids", action="store_true", help="store generated token ids (needed for analysis)")
     ap.add_argument("--batch_size", type=int, default=1, help="problems decoded together (continuous batching)")
+    ap.add_argument("--helper_model", default=None, help="full-KV helper for the rescue=1 (KV-Rescue-lite) baseline")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype),
                                                  attn_implementation=args.attn).to(device).eval()
+    helper = None
+    if args.helper_model:
+        helper = AutoModelForCausalLM.from_pretrained(args.helper_model, dtype=getattr(torch, args.dtype),
+                                                      attn_implementation=args.attn).to(device).eval()
     delim = delimiter_token_ids(tok)
     gen_eos = model.generation_config.eos_token_id
     eos = {tok.eos_token_id} | set(gen_eos if isinstance(gen_eos, list) else [gen_eos])
@@ -171,7 +177,14 @@ def main():
                     observe_alpha = float(comp_opts.pop("alpha", 1e-4))
                 comp_opts.setdefault("buffer", args.buffer)
                 comp_opts.setdefault("window", args.window)
-                if comp_opts.pop("rollback", 0):
+                rescue = comp_opts.pop("rescue", 0)
+                if rescue:  # KV-Rescue-lite: same trigger as rollback, the helper rewrites the step
+                    if helper is None:
+                        raise SystemExit("rescue=1 needs --helper_model")
+                    rb_opts = {k: comp_opts.pop(k) for k in ("max_rollbacks", "max_rewind", "helper_max_step")
+                               if k in comp_opts}
+                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period") if k in comp_opts}
+                elif comp_opts.pop("rollback", 0):
                     comp_opts["offload"] = True
                     rb_opts = {k: comp_opts.pop(k) for k in
                                ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
@@ -193,7 +206,9 @@ def main():
                 make_comp = None if comp_opts is None else (
                     lambda capture: KVCompressor(model, name, budget, capture=capture, **comp_opts))
                 make_det = None if det_opts is None else (lambda: DegenerationDetector(**det_opts))
+                make_help = (lambda: HelperState(helper)) if name != "full" and cfg.get("rescue") else None
                 results = generate_batch(model, prompts, make_compressor=make_comp, make_detector=make_det,
+                                         make_helper=make_help,
                                          batch_size=args.batch_size,
                                          window=comp_opts["window"] if comp_opts else args.window,
                                          observe_alpha=observe_alpha,
@@ -205,7 +220,9 @@ def main():
                 comp = None if comp_opts is None else KVCompressor(model, name, budget, **comp_opts)
                 det = None if det_opts is None else DegenerationDetector(**det_opts)
                 for j, (i, prob) in enumerate(todo):
-                    res = generate(model, prompts[j], compressor=comp, detector=det, seed=args.seed + i, **common)
+                    hs = HelperState(helper) if name != "full" and cfg.get("rescue") else None
+                    res = generate(model, prompts[j], compressor=comp, detector=det, seed=args.seed + i,
+                                   helper_state=hs, **common)
                     write(run, name, cfg, budget, i, prob, prompts[j], res)
                 if comp is not None:
                     comp.close()

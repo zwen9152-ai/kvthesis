@@ -158,3 +158,51 @@ def test_lazy_observer_tracks_recurrence(model):
         torch.testing.assert_close(slots.mp[li][0, :, :T], mp)
         gaps.append(float(mp.max()))
     assert max(gaps) > 1  # some token was re-attended after a gap
+
+
+@pytest.fixture(scope="module")
+def helper():
+    torch.manual_seed(1)
+    cfg = Qwen2Config(vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                      num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=4096)
+    return Qwen2ForCausalLM(cfg).eval()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_rescue_lite_batch_matches_single(model, helper, temperature):
+    from kvcomp.rescue import HelperState
+    ps = prompts()
+    eos = {63}
+
+    def det():
+        return DegenerationDetector(min_span=24, max_period=16, check_every=4)
+    single = []
+    for i, p in enumerate(ps):
+        comp = KVCompressor(model, "snapkv", budget=32, buffer=16, window=8)
+        single.append(generate(model, p, compressor=comp, detector=det(), delimiter_ids=DELIM, max_new_tokens=200,
+                               temperature=temperature, seed=i, refeed=8, eos_ids=eos,
+                               helper_state=HelperState(helper), helper_max_step=20))
+        comp.close()
+    res = dict(generate_batch(
+        model, ps, make_compressor=lambda c: KVCompressor(model, "snapkv", budget=32, buffer=16, window=8, capture=c),
+        make_detector=det, make_helper=lambda: HelperState(helper), helper_max_step=20, delimiter_ids=DELIM,
+        batch_size=3, max_new_tokens=200, temperature=temperature, seeds=list(range(len(ps))), refeed=8,
+        eos_ids=eos, window=8))
+    batch = [res[i] for i in range(len(ps))]
+    assert [b["gen_ids"] for b in batch] == [s["gen_ids"] for s in single]
+    assert [b["helper_tokens"] for b in batch] == [s["helper_tokens"] for s in single]
+    if temperature == 0:  # greedy decoding of the random model loops; sampling may not
+        assert sum(s["helper_tokens"] for s in single) > 0, "the helper should take over at least once"
+
+
+def test_helper_state_reuses_prefix(helper):
+    from kvcomp.rescue import HelperState
+    h = HelperState(helper)
+    ctx = list(range(1, 20))
+    a = h.write_step(ctx, delimiter_ids={5}, eos_ids=set(), max_step=10, temperature=0.0, top_p=1.0)
+    # rewriting from an earlier cut must equal a fresh helper on the same context
+    cut_ctx = ctx[:12]
+    b = h.write_step(cut_ctx, delimiter_ids={5}, eos_ids=set(), max_step=10, temperature=0.0, top_p=1.0)
+    fresh = HelperState(helper).write_step(cut_ctx, delimiter_ids={5}, eos_ids=set(), max_step=10,
+                                           temperature=0.0, top_p=1.0)
+    assert b == fresh and len(a) > 0

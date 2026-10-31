@@ -159,6 +159,8 @@ class _Seq:
         self.computed = 0
         self.max_cache = self.max_offload = 0
         self.logits = None  # next-token logits waiting to be sampled
+        self.done = False  # finished by a helper-written EOS
+        self.helper = None
         self.t0 = time.perf_counter()
 
 
@@ -167,11 +169,13 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                    batch_size: int = 16, max_new_tokens: int = 4096, temperature: float = 0.0,
                    top_p: float = 1.0, eos_ids=(), seeds=None, max_rollbacks: int = 4, refeed: int = 16,
                    max_rewind: int = 512, recall: bool = True, escalate: float = 1.0, max_budget: int = 4096,
-                   window: int = 16, observe_alpha: float | None = None, debug: dict | None = None):
+                   window: int = 16, observe_alpha: float | None = None, debug: dict | None = None,
+                   make_helper=None, helper_max_step: int = 256):
     """Decode every prompt in ``prompts`` (each (1, P)) and yield ``(index, result)`` as each finishes.
 
     ``make_compressor(capture)`` / ``make_detector()`` build fresh per-problem objects
-    (or are None for full KV). Results have the same fields as ``decode.generate``.
+    (or are None for full KV); ``make_helper()`` returns a ``rescue.HelperState`` for the
+    KV-Rescue-lite baseline. Results have the same fields as ``decode.generate``.
     """
     device = model.device
     delimiter_ids = set(delimiter_ids)
@@ -215,10 +219,14 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         idx = queue.pop(0)
         comp = make_compressor(_CaptureRow(shared, b)) if make_compressor is not None else None
         det = make_detector() if make_detector is not None else None
-        if det is not None and (comp is None or not comp.offload):
+        if det is not None and comp is None:
+            raise ValueError("degeneration handling needs a compressor")
+        if det is not None and make_helper is None and not comp.offload:
             raise ValueError("rollback needs a compressor with offload=True")
         s = _Seq(idx, prompts[idx], comp, det, delimiter_ids, max_new_tokens,
                  None if seeds is None else seeds[idx], temperature, device)
+        if make_helper is not None:
+            s.helper = make_helper()
         if comp is not None:
             comp.reset()
         if det is not None:
@@ -251,6 +259,8 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             "n_compress": c.n_compress if c is not None else 0,
             "n_recalled": c.n_recalled if c is not None else 0,
             "final_budget": c.budget if c is not None else None,
+            "helper_tokens": s.helper.generated if s.helper is not None else 0,
+            "helper_max_cache_len": s.helper.max_cache if s.helper is not None else 0,
             "rollbacks": s.rollbacks, "seconds": elapsed, "tok_per_s": s.computed / max(elapsed, 1e-9),
             "batch_size": B,
         }
@@ -304,6 +314,19 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             cut = P + loop_start
         cut = max(cut, P + 1)
         s.rollbacks.append({"at": len(s.generated), "loop_start": loop_start, "cut": cut - P})
+        if s.helper is not None:
+            from .rescue import takeover
+            cache = slots.to_dynamic(b)
+            s.generated, new, logits = takeover(
+                model, cache, comp, det, s.tracker, s.helper, s.generated, P, s.prompt, cut,
+                delimiter_ids=delimiter_ids, eos_ids=eos_ids, max_step=helper_max_step,
+                temperature=temperature, top_p=top_p, generator=s.generator,
+                forward=lambda c, t, st: single_forward(b, c, t, st))
+            slots.from_dynamic(b, cache)
+            s.rollbacks[-1]["helper_tokens"] = len(new)
+            s.max_cache = max(s.max_cache, slots.lens[b])
+            s.logits, s.done = logits, logits is None
+            return
         s.generated = s.generated[: cut - P]
         s.tracker.truncate(cut, s.generated)
         det.truncate(s.generated, lambda t: t in delimiter_ids)
@@ -338,7 +361,7 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             s = seqs[b]
             if s is None:
                 continue
-            while s is not None and len(s.generated) >= max_new_tokens:
+            while s is not None and (s.done or len(s.generated) >= max_new_tokens):
                 yield finish(b)
                 s = None
                 if queue:

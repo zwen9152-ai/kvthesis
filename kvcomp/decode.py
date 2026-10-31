@@ -12,6 +12,7 @@ re-selects its budget with them. Decoding then resumes (with sampling, a new dra
 """
 
 import time
+from types import SimpleNamespace
 
 import torch
 from transformers import DynamicCache
@@ -45,18 +46,22 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
              max_new_tokens: int = 4096, temperature: float = 0.0, top_p: float = 1.0,
              eos_ids=(), seed: int | None = None, max_rollbacks: int = 4, refeed: int = 16,
              max_rewind: int = 512, recall: bool = True, escalate: float = 1.0,
-             max_budget: int = 4096) -> dict:
+             max_budget: int = 4096, helper_state=None, helper_max_step: int = 256) -> dict:
     """Generate from ``prompt_ids`` (shape (1, P)); returns token ids and statistics.
 
     With ``escalate > 1`` every rollback multiplies the compressor budget (capped at
     ``max_budget``) before re-selection, so problems that keep looping get more memory.
+    With ``helper_state`` (``rescue.HelperState``) a detected loop is handled by the
+    KV-Rescue-lite baseline instead: a full-KV helper model rewrites the looping step.
     """
     device = model.device
     P = prompt_ids.shape[1]
     generator = None
     if seed is not None and temperature > 0:
         generator = torch.Generator(device=device).manual_seed(seed)
-    if detector is not None and (compressor is None or not compressor.offload):
+    if detector is not None and compressor is None:
+        raise ValueError("degeneration handling needs a compressor")
+    if detector is not None and helper_state is None and not compressor.offload:
         raise ValueError("rollback needs a compressor with offload=True")
 
     delimiter_ids = set(delimiter_ids)
@@ -106,6 +111,19 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
             cut = P + loop_start
         cut = max(cut, P + 1)  # keep >= 1 token to re-feed
         rollbacks.append({"at": len(generated), "loop_start": loop_start, "cut": cut - P})
+        if helper_state is not None:
+            from .rescue import takeover
+            generated, new, logits = takeover(
+                model, cache, compressor, detector, tracker, helper_state, generated, P, prompt_ids[0].tolist(),
+                cut, delimiter_ids=delimiter_ids, eos_ids=eos_ids, max_step=helper_max_step,
+                temperature=temperature, top_p=top_p, generator=generator)
+            rollbacks[-1]["helper_tokens"] = len(new)
+            max_cache = max(max_cache, cache_len(cache))
+            max_bytes = max(max_bytes, cache_bytes(cache))
+            if logits is None:  # the helper finished the answer
+                break
+            out = SimpleNamespace(logits=logits[None, None])
+            continue
         generated = generated[: cut - P]
         tracker.truncate(cut, generated)
         detector.truncate(generated, lambda t: t in delimiter_ids)
@@ -136,6 +154,8 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         "max_offload_bytes": max_offload,
         "n_compress": compressor.n_compress if compressor is not None else 0,
         "n_recalled": compressor.n_recalled if compressor is not None else 0,
+        "helper_tokens": helper_state.generated if helper_state is not None else 0,
+        "helper_max_cache_len": helper_state.max_cache if helper_state is not None else 0,
         "final_budget": compressor.budget if compressor is not None else None,
         "rollbacks": rollbacks,
         "seconds": elapsed,
