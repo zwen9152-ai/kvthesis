@@ -75,6 +75,9 @@ def ablation():
         f"snapkv@{REWIND},max_rewind=0",          # cut at the loop itself, not the step start
         f"snapkv@{REWIND},min_span=64",           # detector sensitivity
         f"snapkv@{REWIND},min_span=192",
+        f"snapkv@{REWIND},step_repeats=2",        # repeated-step trigger (the dominant signal)
+        f"snapkv@{REWIND},step_repeats=4",
+        f"snapkv@{REWIND},min_step_len=24",       # ignore short repeated lines (enumerations)
         "snapkv",                                 # static memory-matched control (budget 512)
     ]
     jobs = [job(M15, "math500", n, maxtok, 0, s, [128]) for s in specs[:-1]]

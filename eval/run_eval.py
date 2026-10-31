@@ -188,13 +188,13 @@ def main():
                         raise SystemExit("rescue=1 needs --helper_model")
                     rb_opts = {k: comp_opts.pop(k) for k in ("max_rollbacks", "max_rewind", "helper_max_step")
                                if k in comp_opts}
-                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period") if k in comp_opts}
+                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in comp_opts}
                 elif comp_opts.pop("rollback", 0):
                     comp_opts["offload"] = True
                     rb_opts = {k: comp_opts.pop(k) for k in
                                ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
                                if k in comp_opts}
-                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period") if k in comp_opts}
+                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in comp_opts}
             todo = [(i, prob) for i, prob in enumerate(problems)
                     if i % n_shards == shard and (run, prob["id"]) not in done]
             if not todo:

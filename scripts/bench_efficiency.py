@@ -48,7 +48,7 @@ def build(model, name, cfg, budget, window, buffer):
         opts["offload"] = True
         rb = {k: opts.pop(k) for k in ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
               if k in opts}
-        det_opts = {k: opts.pop(k) for k in ("min_span", "max_period") if k in opts}
+        det_opts = {k: opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in opts}
 
     def make_comp(capture):
         return KVCompressor(model, name, budget, capture=capture, **opts)
