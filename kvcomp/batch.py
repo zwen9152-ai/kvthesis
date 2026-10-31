@@ -388,8 +388,9 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         for b in live:
             boundary[b] = seqs[b].tracker.add_token(step_tok[b])
         lens = torch.tensor(slots.lens, device=device)
-        slots.ensure(int(lens.max()) + 1)
-        slots.write_at, slots.span = lens, int(lens.max()) + 1
+        span = max(slots.lens) + 1  # from the Python list: no device sync
+        slots.ensure(span)
+        slots.write_at, slots.span = lens, span
         mask = torch.arange(slots.span, device=device)[None, :] <= lens[:, None]  # (B, span)
         pos = [seqs[b].P + len(seqs[b].generated) - 1 if step_tok[b] is not None else 0 for b in range(B)]
         ids = torch.tensor([[t if t is not None else 0] for t in step_tok], device=device)
