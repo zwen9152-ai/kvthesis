@@ -172,3 +172,18 @@ def test_rollback_without_recall_keeps_heads_consistent(model, prompt):
     for i, p in enumerate(comp.pos):
         assert p.shape[-1] == n and bool((p < cut).all())
         assert get_kv(cache, i)[0].shape[-2] == P + n
+
+
+def test_rollback_escalates_budget(model, prompt):
+    from kvcomp.degeneration import DegenerationDetector
+    comp = KVCompressor(model, "snapkv", budget=32, buffer=16, window=8, offload=True)
+    det = DegenerationDetector(min_span=24, max_period=16, check_every=4)
+    res = generate(model, prompt, compressor=comp, detector=det, delimiter_ids=DELIM,
+                   max_new_tokens=300, temperature=0.0, max_rollbacks=3, refeed=8, escalate=2, max_budget=96)
+    assert res["rollbacks"], "the random tiny model should loop at least once"
+    budgets = [r["budget"] for r in res["rollbacks"]]
+    assert budgets == [min(96, 32 * 2 ** (k + 1)) for k in range(len(budgets))]
+    assert res["final_budget"] == budgets[-1]
+    comp.reset()
+    comp.close()
+    assert comp.budget == 32

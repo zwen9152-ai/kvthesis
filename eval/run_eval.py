@@ -2,7 +2,8 @@
 
 Method specs accept overrides, e.g. ``stepkv@anchors=4,beta=2,step_trigger=1``.
 ``rollback=1`` turns on degeneration detection + recall + rollback (implies offload),
-e.g. ``snapkv@rollback=1``; detector knobs: ``max_rollbacks``, ``refeed``, ``min_span``.
+e.g. ``snapkv@rollback=1``; knobs: ``max_rollbacks``, ``refeed``, ``min_span``, and
+``escalate`` (budget multiplier per rollback, e.g. ``snapkv@rollback=1,escalate=2``).
 Re-running with the same --out resumes: finished (run, problem) pairs are skipped.
 
 Example:
@@ -130,7 +131,7 @@ def main():
                 opts.setdefault("window", args.window)
                 if opts.pop("rollback", 0):
                     opts["offload"] = True
-                    rb_opts = {k: opts.pop(k) for k in ("max_rollbacks", "refeed", "max_rewind", "recall")
+                    rb_opts = {k: opts.pop(k) for k in ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
                                if k in opts}
                     det = DegenerationDetector(**{k: opts.pop(k) for k in ("min_span", "max_period") if k in opts})
                 comp = KVCompressor(model, name, budget, **opts)

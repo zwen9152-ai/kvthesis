@@ -68,14 +68,23 @@ def select_h2o(ctx: SelectCtx) -> torch.Tensor:
 
 
 def select_rkv(ctx: SelectCtx) -> torch.Tensor:
-    """R-KV (re-implementation): importance mixed with key non-redundancy."""
-    lam = ctx.cfg.get("rkv_lambda", 0.1)
+    """R-KV (re-implementation of the official ``R1KV``): importance mixed with key redundancy.
+
+    Redundancy follows ``cal_similarity``: cosine similarity between keys, where each key's
+    most recent near-duplicate (similarity > ``rkv_threshold``) is exempted so the newest
+    copy of repeated content survives; mean over the other keys, then softmax.
+    """
+    lam = ctx.cfg.get("rkv_lambda", 0.07)
     imp = _pool(ctx.scores, ctx.cfg.get("pool", 7))
     imp = imp / imp.sum(-1, keepdim=True).clamp(min=1e-9)
     kn = F.normalize(ctx.keys.float(), dim=-1)
     sim = torch.matmul(kn, kn.transpose(-1, -2))  # (B, H, T, T)
     sim.diagonal(dim1=-2, dim2=-1).zero_()
-    redundancy = sim.mean(-1).softmax(-1)
+    t = sim.shape[-1]
+    idx = torch.arange(t, device=sim.device)
+    last = torch.where(sim > ctx.cfg.get("rkv_threshold", 0.5), idx, torch.zeros_like(idx)).amax(-1)
+    sim.scatter_(-1, last.unsqueeze(-1), 0.0)
+    redundancy = sim.mean(-2).softmax(-1)
     score = lam * imp - (1 - lam) * redundancy
     return _topk(_force_recent(score, ctx.recent), ctx.budget)
 

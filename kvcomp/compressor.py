@@ -8,6 +8,7 @@ so the scoring queries come from a complete step.
 
 With ``offload`` the evicted entries are moved to CPU memory instead of being
 dropped, so ``rollback`` can restore the exact uncompressed history.
+``generate`` may raise ``budget`` after a rollback (escalation); ``reset`` restores it.
 """
 
 import torch
@@ -26,6 +27,7 @@ class KVCompressor:
             raise ValueError("budget must exceed the recent window")
         self.select = METHODS[method]
         self.method = method
+        self.base_budget = budget
         self.budget = budget
         self.buffer = buffer
         self.window = window
@@ -38,6 +40,7 @@ class KVCompressor:
 
     def reset(self):
         self.capture.reset()
+        self.budget = self.base_budget  # rollback may have escalated it
         self.prompt_len = 0
         self.pos: list[torch.Tensor] = []  # per layer (B, H, T_decoded) absolute positions
         self.state: list[dict] = []

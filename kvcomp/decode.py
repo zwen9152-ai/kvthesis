@@ -44,8 +44,13 @@ def _forward(model, cache, tokens: list[int], start_pos: int):
 def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None, delimiter_ids=frozenset(),
              max_new_tokens: int = 4096, temperature: float = 0.0, top_p: float = 1.0,
              eos_ids=(), seed: int | None = None, max_rollbacks: int = 4, refeed: int = 16,
-             max_rewind: int = 512, recall: bool = True) -> dict:
-    """Generate from ``prompt_ids`` (shape (1, P)); returns token ids and statistics."""
+             max_rewind: int = 512, recall: bool = True, escalate: float = 1.0,
+             max_budget: int = 4096) -> dict:
+    """Generate from ``prompt_ids`` (shape (1, P)); returns token ids and statistics.
+
+    With ``escalate > 1`` every rollback multiplies the compressor budget (capped at
+    ``max_budget``) before re-selection, so problems that keep looping get more memory.
+    """
     device = model.device
     P = prompt_ids.shape[1]
     generator = None
@@ -106,6 +111,8 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         detector.truncate(generated, lambda t: t in delimiter_ids)
         c0 = max(P, cut - refeed)
         compressor.rollback(cache, c0, recall=recall)
+        compressor.budget = min(max_budget, max(compressor.budget, int(compressor.budget * escalate)))
+        rollbacks[-1]["budget"] = compressor.budget
         chunk = generated[c0 - P:]
         out = _forward(model, cache, chunk, c0)
         # recalled history is resident until the re-selection below: a transient peak
@@ -129,6 +136,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         "max_offload_bytes": max_offload,
         "n_compress": compressor.n_compress if compressor is not None else 0,
         "n_recalled": compressor.n_recalled if compressor is not None else 0,
+        "final_budget": compressor.budget if compressor is not None else None,
         "rollbacks": rollbacks,
         "seconds": elapsed,
         "tok_per_s": computed / max(elapsed, 1e-9),
