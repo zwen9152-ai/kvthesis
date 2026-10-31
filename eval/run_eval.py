@@ -24,6 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from eval import data
 from eval.grader import extract_answer, is_equiv
 from kvcomp import KVCompressor, generate
+from kvcomp.batch import generate_batch
 from kvcomp.degeneration import DegenerationDetector
 from kvcomp.segment import delimiter_token_ids
 
@@ -115,6 +116,7 @@ def main():
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--out", required=True)
     ap.add_argument("--save_ids", action="store_true", help="store generated token ids (needed for analysis)")
+    ap.add_argument("--batch_size", type=int, default=1, help="problems decoded together (continuous batching)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -134,49 +136,71 @@ def main():
             done = {(r["run"], r["id"]) for r in map(json.loads, f)}
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
+    def write(run, name, cfg, budget, i, prob, ids, res):
+        text = tok.decode(res["gen_ids"], skip_special_tokens=True)
+        pred = extract_answer(text)
+        rec = {"run": run, "method": name, "cfg": cfg, "budget": budget, "id": prob["id"],
+               "gold": prob["answer"], "pred": pred, "correct": is_equiv(pred, prob["answer"]),
+               "prompt_len": ids.shape[1], "degenerate": has_loop(res["gen_ids"], delim),
+               "dataset": args.dataset, "seed": args.seed, "dtype": args.dtype,
+               **{k: v for k, v in res.items() if k != "gen_ids"}}
+        if args.save_ids:
+            rec["prompt_ids"] = ids[0].tolist()
+            rec["gen_ids"] = res["gen_ids"]
+        # one unbuffered O_APPEND write per line, so parallel workers never interleave
+        with open(args.out, "ab", buffering=0) as f:
+            f.write((json.dumps(rec, ensure_ascii=False) + "\n").encode())
+        done.add((run, prob["id"]))
+        print(f"[{run}] {i + 1}/{len(problems)} {prob['id']} correct={rec['correct']} "
+              f"len={res['num_tokens']} maxKV={res['max_cache_len']} {res['tok_per_s']:.1f} tok/s",
+              flush=True)
+
     for spec in split_methods(args.methods):
         spec, shard, n_shards = pop_shard(spec)
         name, cfg = parse_method(spec)
         for budget in ([None] if name == "full" else budgets):
             run = run_key(spec, budget)
-            comp, det, rb_opts = None, None, {}
+            comp_opts, det_opts, rb_opts = None, None, {}
             if name != "full":
-                opts = dict(cfg)
-                opts.setdefault("buffer", args.buffer)
-                opts.setdefault("window", args.window)
-                if opts.pop("rollback", 0):
-                    opts["offload"] = True
-                    rb_opts = {k: opts.pop(k) for k in ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
-                               if k in opts}
-                    det = DegenerationDetector(**{k: opts.pop(k) for k in ("min_span", "max_period") if k in opts})
-                comp = KVCompressor(model, name, budget, **opts)
-            for i, prob in enumerate(problems):
-                if i % n_shards != shard or (run, prob["id"]) in done:
-                    continue
+                comp_opts = dict(cfg)
+                comp_opts.setdefault("buffer", args.buffer)
+                comp_opts.setdefault("window", args.window)
+                if comp_opts.pop("rollback", 0):
+                    comp_opts["offload"] = True
+                    rb_opts = {k: comp_opts.pop(k) for k in
+                               ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
+                               if k in comp_opts}
+                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period") if k in comp_opts}
+            todo = [(i, prob) for i, prob in enumerate(problems)
+                    if i % n_shards == shard and (run, prob["id"]) not in done]
+            if not todo:
+                continue
+            prompts = []
+            for _, prob in todo:
                 ids = data.build_prompt(tok, prob["question"])
-                if not torch.is_tensor(ids):
-                    ids = ids["input_ids"]
-                res = generate(model, ids, compressor=comp, detector=det, delimiter_ids=delim, **rb_opts,
-                               max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-                               top_p=args.top_p, eos_ids=eos, seed=args.seed + i)
-                text = tok.decode(res["gen_ids"], skip_special_tokens=True)
-                pred = extract_answer(text)
-                rec = {"run": run, "method": name, "cfg": cfg, "budget": budget, "id": prob["id"],
-                       "gold": prob["answer"], "pred": pred, "correct": is_equiv(pred, prob["answer"]),
-                       "prompt_len": ids.shape[1], "degenerate": has_loop(res["gen_ids"], delim),
-                       **{k: v for k, v in res.items() if k != "gen_ids"}}
-                if args.save_ids:
-                    rec["prompt_ids"] = ids[0].tolist()
-                    rec["gen_ids"] = res["gen_ids"]
-                # one unbuffered O_APPEND write per line, so parallel workers never interleave
-                with open(args.out, "ab", buffering=0) as f:
-                    f.write((json.dumps(rec, ensure_ascii=False) + "\n").encode())
-                done.add((run, prob["id"]))
-                print(f"[{run}] {i + 1}/{len(problems)} {prob['id']} correct={rec['correct']} "
-                      f"len={res['num_tokens']} maxKV={res['max_cache_len']} {res['tok_per_s']:.1f} tok/s",
-                      flush=True)
-            if comp is not None:
-                comp.close()
+                prompts.append(ids if torch.is_tensor(ids) else ids["input_ids"])
+            prompts = [p.to(device) for p in prompts]
+            common = dict(delimiter_ids=delim, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+                          top_p=args.top_p, eos_ids=eos, **rb_opts)
+
+            if args.batch_size > 1:
+                make_comp = None if comp_opts is None else (
+                    lambda capture: KVCompressor(model, name, budget, capture=capture, **comp_opts))
+                make_det = None if det_opts is None else (lambda: DegenerationDetector(**det_opts))
+                results = generate_batch(model, prompts, make_compressor=make_comp, make_detector=make_det,
+                                         batch_size=args.batch_size, window=args.window,
+                                         seeds=[args.seed + i for i, _ in todo], **common)
+                for j, res in results:
+                    i, prob = todo[j]
+                    write(run, name, cfg, budget, i, prob, prompts[j], res)
+            else:
+                comp = None if comp_opts is None else KVCompressor(model, name, budget, **comp_opts)
+                det = None if det_opts is None else DegenerationDetector(**det_opts)
+                for j, (i, prob) in enumerate(todo):
+                    res = generate(model, prompts[j], compressor=comp, detector=det, seed=args.seed + i, **common)
+                    write(run, name, cfg, budget, i, prob, prompts[j], res)
+                if comp is not None:
+                    comp.close()
     summarize(args.out)
 
 

@@ -20,7 +20,7 @@ from .query_capture import QueryCapture, attention_modules, window_attention
 
 class KVCompressor:
     def __init__(self, model, method: str, budget: int, buffer: int = 128, window: int = 16,
-                 step_trigger: bool = False, offload: bool = False, **cfg):
+                 step_trigger: bool = False, offload: bool = False, capture=None, **cfg):
         if method not in METHODS:
             raise ValueError(f"unknown method {method!r}; choose from {sorted(METHODS)}")
         if budget <= window:
@@ -35,7 +35,9 @@ class KVCompressor:
         self.offload = offload
         self.cfg = cfg
         self.modules = attention_modules(model)
-        self.capture = QueryCapture(model, window)
+        # batched decoding passes a per-sequence view of one shared capture
+        self.own_capture = capture is None
+        self.capture = QueryCapture(model, window) if capture is None else capture
         self.reset()
 
     def reset(self):
@@ -49,7 +51,8 @@ class KVCompressor:
         self.n_recalled = 0
 
     def close(self):
-        self.capture.remove()
+        if self.own_capture:
+            self.capture.remove()
 
     def on_prefill(self, cache, prompt_len: int):
         self.prompt_len = prompt_len
@@ -63,16 +66,23 @@ class KVCompressor:
 
     def on_tokens(self, cache, positions: list[int], steps_fn, at_boundary: bool) -> bool:
         """Register newly cached tokens and compress if the schedule says so."""
-        new = torch.tensor(positions, device=self.pos[0].device)
-        for i, p in enumerate(self.pos):
-            self.pos[i] = torch.cat([p, new.expand(*p.shape[:2], -1)], dim=-1)
-        n = self.pos[0].shape[-1]
-        if n < self.budget + self.buffer:
-            return False
-        if self.step_trigger and not at_boundary and n < self.budget + 2 * self.buffer:
+        self.append(positions)
+        if not self.due(at_boundary):
             return False
         self.compress(cache, steps_fn)
         return True
+
+    def append(self, positions: list[int]) -> None:
+        new = torch.tensor(positions, device=self.pos[0].device)
+        for i, p in enumerate(self.pos):
+            self.pos[i] = torch.cat([p, new.expand(*p.shape[:2], -1)], dim=-1)
+
+    def due(self, at_boundary: bool) -> bool:
+        """Whether the schedule asks for a compression now (``append`` already called)."""
+        n = self.pos[0].shape[-1]
+        if n < self.budget + self.buffer:
+            return False
+        return not (self.step_trigger and not at_boundary and n < self.budget + 2 * self.buffer)
 
     @torch.no_grad()
     def compress(self, cache, steps_fn):
