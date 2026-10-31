@@ -1,6 +1,6 @@
 """Write the thesis experiment matrix as a prioritized run_eval queue (one job per line).
 
-    python scripts/make_queue.py verify   > logs/queue.txt   # ~2 GPU-h: batching check + throughput
+    python scripts/make_queue.py verify   > logs/queue.txt   # batching check (scripts/run_verify.sh)
     python scripts/make_queue.py main ablation 7b > logs/queue.txt
     bash scripts/run_queue.sh logs/queue.txt                  # workers pop lines in order
 
@@ -37,7 +37,7 @@ def job(model, dataset, n, maxtok, seed, methods, budgets, extra=""):
 
 
 def verify():
-    """Batched decoding on the real model: equality with batch 1 (greedy) and throughput."""
+    """Batched decoding on the real model: same accuracy / lengths as batch 1 (greedy)."""
     out = "results/verify/math500_batching.jsonl"
     common = f"--model {M15} --dataset math500 --n 16 --max_new_tokens 2048 --temperature 0 --save_ids"
     jobs = []
@@ -45,9 +45,6 @@ def verify():
         for m in ("full", f"snapkv@{REWIND}", "lazy", "vase"):
             jobs.append(f"{common} --methods {m} --budgets 128 --batch_size {bs} "
                         f"--out {out.replace('.jsonl', f'_bs{bs}.jsonl')}")
-    for bs in (8, 32, 64):  # throughput sweep
-        jobs.append(f"--model {M15} --dataset math500 --n 64 --max_new_tokens 2048 --methods snapkv "
-                    f"--budgets 128 --batch_size {bs} --out results/verify/throughput_bs{bs}.jsonl")
     return jobs
 
 

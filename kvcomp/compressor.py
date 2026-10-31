@@ -11,6 +11,8 @@ dropped, so ``rollback`` can restore the exact uncompressed history.
 ``generate`` may raise ``budget`` after a rollback (escalation); ``reset`` restores it.
 """
 
+import time
+
 import torch
 
 from .cache_utils import get_kv, num_layers, set_kv
@@ -33,6 +35,7 @@ class KVCompressor:
         self.window = window
         self.step_trigger = step_trigger
         self.offload = offload
+        self.profile = bool(cfg.pop("profile", False))
         self.cfg = cfg
         self.modules = attention_modules(model)
         # batched decoding passes a per-sequence view of one shared capture
@@ -50,6 +53,11 @@ class KVCompressor:
         self.n_compress = 0
         self.n_recalled = 0
         self.rng = None  # stochastic methods: re-seeded per problem, created on the cache device
+        # efficiency accounting (chapter 5); timings only when ``profile`` is set (they sync the GPU)
+        self.bytes_offloaded = 0  # GPU -> CPU
+        self.bytes_recalled = 0  # CPU -> GPU
+        self.t_compress = 0.0
+        self.t_rollback = 0.0
 
     def close(self):
         if self.own_capture:
@@ -87,6 +95,7 @@ class KVCompressor:
 
     @torch.no_grad()
     def compress(self, cache, steps_fn):
+        t0 = self._tick()
         P = self.prompt_len
         for i in range(num_layers(cache)):
             k, v = get_kv(cache, i)
@@ -108,6 +117,14 @@ class KVCompressor:
                 if torch.is_tensor(val) and val.shape == pos.shape:
                     self.state[i][key] = val.gather(-1, idx)
         self.n_compress += 1
+        self.t_compress += self._tick() - t0 if self.profile else 0.0
+
+    def _tick(self) -> float:
+        if not self.profile:
+            return 0.0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
 
     def _offload(self, i, kd, vd, pos, keep_idx):
         keep = torch.zeros_like(pos, dtype=torch.bool).scatter_(-1, keep_idx, True)
@@ -115,6 +132,7 @@ class KVCompressor:
         ev = keep.to(torch.int8).argsort(dim=-1, stable=True)[..., :n_evict]  # evicted first, in order
         gev = ev.unsqueeze(-1).expand(-1, -1, -1, kd.shape[-1])
         new = (pos.gather(-1, ev).cpu(), kd.gather(2, gev).cpu(), vd.gather(2, gev).cpu())
+        self.bytes_offloaded += 2 * new[1].numel() * new[1].element_size()
         old = self.store[i]
         self.store[i] = new if old is None else tuple(torch.cat([a, b], dim=-2 if a.dim() == 4 else -1)
                                                       for a, b in zip(old, new))
@@ -130,6 +148,7 @@ class KVCompressor:
         may then keep different numbers of entries below ``cut``, so every head is trimmed
         to the smallest count, keeping its most recent ones.
         """
+        t0 = self._tick()
         P = self.prompt_len
         merged = []
         for i in range(num_layers(cache)):
@@ -138,6 +157,7 @@ class KVCompressor:
             if recall and self.store[i] is not None:
                 sp, sk, sv = (t.to(k.device) for t in self.store[i])
                 self.n_recalled += int((sp < cut).sum())
+                self.bytes_recalled += sk.numel() * sk.element_size() + sv.numel() * sv.element_size()
                 pos, kd, vd = torch.cat([pos, sp], -1), torch.cat([kd, sk], 2), torch.cat([vd, sv], 2)
             merged.append((pos, kd, vd))
         # all layers must end up with the same length, so trim to the global minimum
@@ -156,3 +176,4 @@ class KVCompressor:
             self.store[i] = None
             self.state[i] = {}
         self.capture.reset()
+        self.t_rollback += self._tick() - t0 if self.profile else 0.0
