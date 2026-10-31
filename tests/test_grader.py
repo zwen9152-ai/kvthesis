@@ -33,3 +33,11 @@ def test_not_equivalent(pred, gold):
 def test_split_methods():
     from eval.run_eval import split_methods
     assert split_methods("full,snapkv@rollback=1,recall=0,h2o") == ["full", "snapkv@rollback=1,recall=0", "h2o"]
+
+
+def test_pop_shard():
+    from eval.run_eval import pop_shard
+    assert pop_shard("snapkv@rollback=1,escalate=2,shard=1/2") == ("snapkv@rollback=1,escalate=2", 1, 2)
+    assert pop_shard("snapkv@shard=0/3,rollback=1") == ("snapkv@rollback=1", 0, 3)
+    assert pop_shard("full@shard=1/2") == ("full", 1, 2)
+    assert pop_shard("snapkv") == ("snapkv", 0, 1)

@@ -15,6 +15,7 @@ Example:
 import argparse
 import json
 import os
+import re
 from collections import defaultdict
 
 import torch
@@ -54,6 +55,19 @@ def split_methods(s: str) -> list[str]:
         else:
             specs.append(part)
     return specs
+
+
+def pop_shard(spec: str) -> tuple[str, int, int]:
+    """Strip a ``shard=k/m`` option: this process then runs only problems with index % m == k.
+
+    The shard is not part of the run name, so shards of one run share their results.
+    """
+    m = re.search(r"[@,]shard=(\d+)/(\d+)", spec)
+    if not m:
+        return spec, 0, 1
+    rest = spec[: m.start()] + ("@" if m.group(0)[0] == "@" else "") + spec[m.end():]
+    rest = rest.replace("@,", "@").rstrip("@")
+    return rest, int(m.group(1)), int(m.group(2))
 
 
 def run_key(spec: str, budget: int | None) -> str:
@@ -121,6 +135,7 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     for spec in split_methods(args.methods):
+        spec, shard, n_shards = pop_shard(spec)
         name, cfg = parse_method(spec)
         for budget in ([None] if name == "full" else budgets):
             run = run_key(spec, budget)
@@ -136,7 +151,7 @@ def main():
                     det = DegenerationDetector(**{k: opts.pop(k) for k in ("min_span", "max_period") if k in opts})
                 comp = KVCompressor(model, name, budget, **opts)
             for i, prob in enumerate(problems):
-                if (run, prob["id"]) in done:
+                if i % n_shards != shard or (run, prob["id"]) in done:
                     continue
                 ids = data.build_prompt(tok, prob["question"])
                 if not torch.is_tensor(ids):
