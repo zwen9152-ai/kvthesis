@@ -8,6 +8,7 @@
 cd "$(dirname "$0")/.."
 QUEUE=${1:-logs/queue.txt}
 WORKERS=${WORKERS:-2}
+START=${START:-0}  # first worker index, to add workers to a running queue
 DTYPE=${DTYPE:-bfloat16}
 mkdir -p results/main results/verify logs
 
@@ -26,7 +27,7 @@ worker() {
     done
 }
 
-for i in $(seq 0 $((WORKERS - 1))); do
+for i in $(seq "$START" $((START + WORKERS - 1))); do
     worker > "logs/$(basename "$QUEUE" .txt)_w$i.log" 2>&1 &
     sleep 30  # stagger model loading
 done
