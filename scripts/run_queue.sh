@@ -27,7 +27,7 @@ worker() {
 }
 
 for i in $(seq 0 $((WORKERS - 1))); do
-    worker > "logs/queue_w$i.log" 2>&1 &
+    worker > "logs/$(basename "$QUEUE" .txt)_w$i.log" 2>&1 &
     sleep 30  # stagger model loading
 done
 wait

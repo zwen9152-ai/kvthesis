@@ -43,13 +43,13 @@ tail -f logs/verify.log
 ## 2. 主实验（按上一步的估算，一次性租一整段）
 
 ```bash
-python scripts/make_queue.py main ablation 7b > logs/queue.txt
+python scripts/make_queue.py main ablation 7b > logs/queue_main.txt
 python scripts/make_queue.py main ablation 7b --estimate      # 再看一眼预计耗时
-WORKERS=2 nohup bash scripts/run_queue.sh logs/queue.txt > logs/queue_nohup.log 2>&1 &
+WORKERS=2 nohup bash scripts/run_queue.sh logs/queue_main.txt > logs/queue_nohup.log 2>&1 &
 ```
 
-- 队列是纯文本文件，每行一个任务，**排在前面的先跑**。运行中可以直接编辑 `logs/queue.txt` 调整顺序，或者追加任务。
-- 失败的任务写到 `logs/queue.txt.failed`。
+- 队列是纯文本文件，每行一个任务，**排在前面的先跑**。运行中可以直接编辑 `logs/queue_main.txt` 调整顺序，或者追加任务。
+- 失败的任务写到 `logs/queue_main.txt.failed`。
 - 断电或关机后重新执行同一条命令即可。已完成的（方法，题目）会自动跳过。
 - `WORKERS` 设多少：先用 2，看 `nvidia-smi`。显存还剩一半以上，而且 GPU 利用率低于 90%，再加到 3。
 - 7B 任务会自动把 batch 调小。如果显存不够（OOM），把那一行的 `--batch_size` 减半，重新放回队列。
@@ -57,7 +57,7 @@ WORKERS=2 nohup bash scripts/run_queue.sh logs/queue.txt > logs/queue_nohup.log 
 查看进度：
 
 ```bash
-tail -n 3 logs/queue_w*.log
+tail -n 3 logs/queue_main_w*.log
 wc -l results/main/*.jsonl
 python -m analysis.gate --runs results/main/1.5b_math500_s0.jsonl
 ```
