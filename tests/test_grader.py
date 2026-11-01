@@ -41,3 +41,9 @@ def test_pop_shard():
     assert pop_shard("snapkv@shard=0/3,rollback=1") == ("snapkv@rollback=1", 0, 3)
     assert pop_shard("full@shard=1/2") == ("full", 1, 2)
     assert pop_shard("snapkv") == ("snapkv", 0, 1)
+
+
+def test_huge_numbers_do_not_overflow():
+    assert not is_equiv("1" + "0" * 400, "2")
+    assert is_equiv("\\frac{" + "1" + "0" * 400 + "}{" + "1" + "0" * 400 + "}", "1")
+    assert is_equiv("0.3333333", "\\frac{1}{3}")

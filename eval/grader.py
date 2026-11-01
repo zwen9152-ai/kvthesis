@@ -81,5 +81,6 @@ def is_equiv(pred: str | None, gold: str) -> bool:
         return True
     pn, gn = to_number(p), to_number(g)
     if pn is not None and gn is not None:
-        return abs(float(pn) - float(gn)) <= 1e-6 * max(1.0, abs(float(gn)))
+        # exact Fraction arithmetic: float() overflows on huge answers (e.g. 10^400)
+        return abs(pn - gn) <= Fraction(1, 10**6) * max(1, abs(gn))
     return False
