@@ -18,8 +18,12 @@ import os
 import re
 from collections import defaultdict
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# Per-step tensors change length every token; without this the caching allocator fragments
+# and two batched workers on one 24 GB GPU end up thrashing at the memory limit.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import torch  # noqa: E402
+from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 from eval import data
 from eval.grader import extract_answer, is_equiv
