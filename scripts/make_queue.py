@@ -104,8 +104,8 @@ def batch_size(j: str, default: int) -> int:
         if full:
             return 4 if maxtok > 8192 else 8
         return 16
-    if full and maxtok > 8192:
-        return 16
+    if full:
+        return 16 if maxtok > 8192 else 32  # full KV grows to max_new_tokens per slot
     return default
 
 
@@ -132,7 +132,7 @@ if __name__ == "__main__":
     ap.add_argument("--estimate", action="store_true")
     ap.add_argument("--tok_s_15b", type=float, default=400, help="aggregate decode throughput, 1.5B")
     ap.add_argument("--tok_s_7b", type=float, default=150, help="aggregate decode throughput, 7B")
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--batch_size", type=int, default=64)  # 1.5B compressed: measured best on a 3090
     args = ap.parse_args()
     jobs = [j for p in args.phases for j in PHASES[p]()]
     if args.estimate:

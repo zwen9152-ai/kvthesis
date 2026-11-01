@@ -50,7 +50,7 @@ class KVCompressor:
         self._pos: list[torch.Tensor] = []  # per layer (B, H, T_decoded) absolute positions
         self._pending: list[int] = []  # positions appended since the last flush (same for all layers)
         self.state: list[dict] = []
-        self.store: list = []  # per layer (pos, keys, values) evicted to CPU, or None
+        self.store: list = []  # per layer: list of (pos, keys, values) chunks evicted to CPU, or None
         self.n_compress = 0
         self.n_recalled = 0
         self.rng = None  # stochastic methods: re-seeded per problem, created on the cache device
@@ -148,14 +148,13 @@ class KVCompressor:
         n_evict = pos.shape[-1] - keep_idx.shape[-1]
         ev = keep.to(torch.int8).argsort(dim=-1, stable=True)[..., :n_evict]  # evicted first, in order
         gev = ev.unsqueeze(-1).expand(-1, -1, -1, kd.shape[-1])
-        new = (pos.gather(-1, ev).cpu(), kd.gather(2, gev).cpu(), vd.gather(2, gev).cpu())
+        new = tuple(_to_host(t) for t in (pos.gather(-1, ev), kd.gather(2, gev), vd.gather(2, gev)))
         self.bytes_offloaded += 2 * new[1].numel() * new[1].element_size()
-        old = self.store[i]
-        self.store[i] = new if old is None else tuple(torch.cat([a, b], dim=-2 if a.dim() == 4 else -1)
-                                                      for a, b in zip(old, new))
+        # chunks are concatenated only on recall: no per-compression copy of the whole store
+        self.store[i] = [new] if self.store[i] is None else self.store[i] + [new]
 
     def offloaded_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for s in self.store if s is not None for t in s[1:])
+        return sum(t.numel() * t.element_size() for s in self.store if s is not None for c in s for t in c[1:])
 
     @torch.no_grad()
     def rollback(self, cache, cut: int, recall: bool = True) -> None:
@@ -172,7 +171,9 @@ class KVCompressor:
             k, v = get_kv(cache, i)
             pos, kd, vd = self.pos[i], k[:, :, P:], v[:, :, P:]
             if recall and self.store[i] is not None:
-                sp, sk, sv = (t.to(k.device) for t in self.store[i])
+                chunks = self.store[i]
+                sp, sk, sv = (torch.cat([c[j] for c in chunks], dim=-2 if j else -1).to(k.device, non_blocking=True)
+                              for j in range(3))
                 self.n_recalled += int((sp < cut).sum())
                 self.bytes_recalled += sk.numel() * sk.element_size() + sv.numel() * sv.element_size()
                 pos, kd, vd = torch.cat([pos, sp], -1), torch.cat([kd, sk], 2), torch.cat([vd, sv], 2)
@@ -194,3 +195,12 @@ class KVCompressor:
             self.state[i] = {}
         self.capture.reset()
         self.t_rollback += self._tick() - t0 if self.profile else 0.0
+
+
+def _to_host(t: torch.Tensor) -> torch.Tensor:
+    """GPU -> pinned CPU copy without a host sync (stream order makes later reads safe)."""
+    if not t.is_cuda:
+        return t.clone()
+    out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    out.copy_(t, non_blocking=True)
+    return out
