@@ -82,6 +82,9 @@ def ablation():
     ]
     jobs = [job(M15, "math500", n, maxtok, 0, s, [128]) for s in specs[:-1]]
     jobs.append(job(M15, "math500", n, maxtok, 0, specs[-1], [512]))
+    # static large budgets: Pareto curve for chapter 4, and a sanity check that the
+    # rkv / lazy ports approach full KV in the regime their papers evaluate (30-50% of length)
+    jobs.append(job(M15, "math500", n, maxtok, 0, "snapkv,rkv,lazy,vase", [512, 1024]))
     return jobs
 
 
