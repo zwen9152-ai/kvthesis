@@ -69,6 +69,28 @@ def select_h2o(ctx: SelectCtx) -> torch.Tensor:
     return _topk(_force_recent(acc, ctx.recent), ctx.budget)
 
 
+def _rkv_redundancy(keys: torch.Tensor, threshold: float, max_elems: int = 1 << 27) -> torch.Tensor:
+    """Softmax of the column means of R-KV's masked key-similarity matrix.
+
+    Rows are processed in chunks so the full (T, T) matrix is never materialised: after a
+    rollback recalls a ~16k-entry history the dense version needs several GB. Each row only
+    zeroes its own diagonal and its own last near-duplicate, so chunking is exact.
+    """
+    kn = F.normalize(keys.float(), dim=-1)
+    t = kn.shape[-2]
+    idx = torch.arange(t, device=kn.device)
+    colsum = kn.new_zeros(*kn.shape[:-2], t)
+    chunk = max(1, max_elems // max(1, kn[..., 0, 0].numel() * t))
+    for r0 in range(0, t, chunk):
+        rows = idx[r0:r0 + chunk]
+        sim = torch.matmul(kn[..., r0:r0 + chunk, :], kn.transpose(-1, -2))  # (..., c, T)
+        sim[..., torch.arange(len(rows), device=kn.device), rows] = 0.0
+        last = torch.where(sim > threshold, idx, torch.zeros_like(idx)).amax(-1)
+        sim.scatter_(-1, last.unsqueeze(-1), 0.0)
+        colsum += sim.sum(-2)
+    return (colsum / t).softmax(-1)
+
+
 def select_rkv(ctx: SelectCtx) -> torch.Tensor:
     """R-KV (re-implementation of the official ``R1KV``): importance mixed with key redundancy.
 
@@ -79,14 +101,7 @@ def select_rkv(ctx: SelectCtx) -> torch.Tensor:
     lam = ctx.cfg.get("rkv_lambda", 0.07)
     imp = _pool(ctx.scores, ctx.cfg.get("pool", 7))
     imp = imp / imp.sum(-1, keepdim=True).clamp(min=1e-9)
-    kn = F.normalize(ctx.keys.float(), dim=-1)
-    sim = torch.matmul(kn, kn.transpose(-1, -2))  # (B, H, T, T)
-    sim.diagonal(dim1=-2, dim2=-1).zero_()
-    t = sim.shape[-1]
-    idx = torch.arange(t, device=sim.device)
-    last = torch.where(sim > ctx.cfg.get("rkv_threshold", 0.5), idx, torch.zeros_like(idx)).amax(-1)
-    sim.scatter_(-1, last.unsqueeze(-1), 0.0)
-    redundancy = sim.mean(-2).softmax(-1)
+    redundancy = _rkv_redundancy(ctx.keys, ctx.cfg.get("rkv_threshold", 0.5))
     score = lam * imp - (1 - lam) * redundancy
     return _topk(_force_recent(score, ctx.recent), ctx.budget)
 
