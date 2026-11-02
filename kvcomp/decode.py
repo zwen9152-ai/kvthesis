@@ -57,7 +57,9 @@ def _forward(model, cache, tokens: list[int], start_pos: int):
     n, clen = len(tokens), cache_len(cache)
     return model(input_ids=torch.tensor([tokens], device=device), past_key_values=cache, use_cache=True,
                  position_ids=torch.arange(start_pos, start_pos + n, device=device)[None],
-                 cache_position=torch.arange(clen, clen + n, device=device))
+                 cache_position=torch.arange(clen, clen + n, device=device),
+                 logits_to_keep=1)  # callers only read the last position; full logits of a 13k-token
+                                    # re-encode would be 13k x 152k vocab ~ 4 GB
 
 
 @torch.no_grad()
