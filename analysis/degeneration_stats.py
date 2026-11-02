@@ -41,11 +41,13 @@ FAMILY_ORDER = ["full", "streaming", "h2o", "snapkv", "rkv", "lazy", "vase", "st
 
 def load(paths):
     runs = defaultdict(dict)
-    for path in paths:
+    for i, path in enumerate(paths):
         with open(path) as f:
             for line in f:
                 r = json.loads(line)
-                runs[r["run"]][r["id"]] = r
+                # several files (e.g. one per seed) re-use problem ids: key by file too, so
+                # pairing stays within a file and no seed overwrites another
+                runs[r["run"]][r["id"] if len(paths) == 1 else f"{i}:{r['id']}"] = r
     return runs
 
 
