@@ -82,8 +82,8 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         generator = torch.Generator(device=device).manual_seed(seed)
     if detector is not None and compressor is None:
         raise ValueError("degeneration handling needs a compressor")
-    if detector is not None and helper_state is None and not compressor.offload:
-        raise ValueError("rollback needs a compressor with offload=True")
+    if detector is not None and helper_state is None and recall and not compressor.offload:
+        raise ValueError("rollback with recall needs a compressor with offload=True")
 
     delimiter_ids = set(delimiter_ids)
     tracker = StepTracker(delimiter_ids, P + max_new_tokens + 1, device)

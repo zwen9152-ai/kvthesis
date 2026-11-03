@@ -206,3 +206,24 @@ def test_helper_state_reuses_prefix(helper):
     fresh = HelperState(helper).write_step(cut_ctx, delimiter_ids={5}, eos_ids=set(), max_step=10,
                                            temperature=0.0, top_p=1.0)
     assert b == fresh and len(a) > 0
+
+
+def test_no_recall_needs_no_offload(model):
+    """Lightweight variant: with recall=0 nothing is offloaded, and decoding is unchanged."""
+    ps = prompts()
+    ref = run_batch(model, ps, "snapkv", True, 200, 2, recall=False, escalate=2, max_budget=96)
+
+    def make_comp(capture):
+        return KVCompressor(model, "snapkv", budget=32, buffer=16, window=8, offload=False, capture=capture)
+    res = dict(generate_batch(model, ps, make_compressor=make_comp,
+                              make_detector=lambda: DegenerationDetector(min_span=24, max_period=16, check_every=4),
+                              delimiter_ids=DELIM, batch_size=2, max_new_tokens=200, temperature=0.0, refeed=8,
+                              window=8, recall=False, escalate=2, max_budget=96))
+    light = [res[i] for i in range(len(ps))]
+    assert [r["gen_ids"] for r in light] == [r["gen_ids"] for r in ref]
+    assert any(r["rollbacks"] for r in light)
+    assert all(r["bytes_offloaded"] == 0 and r["max_offload_bytes"] == 0 for r in light)
+    with pytest.raises(ValueError):
+        dict(generate_batch(model, ps, make_compressor=make_comp,
+                            make_detector=lambda: DegenerationDetector(min_span=24), delimiter_ids=DELIM,
+                            batch_size=2, max_new_tokens=50, window=8, recall=True))

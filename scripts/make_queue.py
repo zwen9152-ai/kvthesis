@@ -98,6 +98,19 @@ def seven_b():
     return jobs
 
 
+LIGHT = f"{REWIND},recall=0,offload=0"  # lightweight RewindKV: no CPU store, no recall transient
+
+
+def light():
+    """Follow-up after the time-averaged KV analysis: RewindKV without recall/offload on all
+    four bases at both start budgets, and a stronger escalation for the no-recall variant."""
+    n, maxtok, _, _ = DATA["math500"]
+    jobs = [job(M15, "math500", n, maxtok, 0, f"{b}@{LIGHT}", BUDGETS) for b in REWIND_ON]
+    jobs.append(job(M15, "math500", n, maxtok, 0, "snapkv@rollback=1,escalate=4,max_budget=1024,recall=0,offload=0",
+                    BUDGETS))
+    return jobs
+
+
 def batch_size(j: str, default: int) -> int:
     """Fit a 24 GB GPU: KV per entry is ~28 KB (1.5B) / ~57 KB (7B, plus 15 GB of weights)."""
     a = j.split()
@@ -112,7 +125,7 @@ def batch_size(j: str, default: int) -> int:
     return default
 
 
-PHASES = {"verify": verify, "main": main_15b, "ablation": ablation, "7b": seven_b}
+PHASES = {"light": light, "verify": verify, "main": main_15b, "ablation": ablation, "7b": seven_b}
 
 
 def estimate(jobs, tok_s_15b: float, tok_s_7b: float):

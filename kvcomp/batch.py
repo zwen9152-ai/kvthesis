@@ -221,8 +221,8 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         det = make_detector() if make_detector is not None else None
         if det is not None and comp is None:
             raise ValueError("degeneration handling needs a compressor")
-        if det is not None and make_helper is None and not comp.offload:
-            raise ValueError("rollback needs a compressor with offload=True")
+        if det is not None and make_helper is None and recall and not comp.offload:
+            raise ValueError("rollback with recall needs a compressor with offload=True")
         s = _Seq(idx, prompts[idx], comp, det, delimiter_ids, max_new_tokens,
                  None if seeds is None else seeds[idx], temperature, device)
         if make_helper is not None:

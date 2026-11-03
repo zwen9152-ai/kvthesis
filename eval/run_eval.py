@@ -194,7 +194,8 @@ def main():
                                if k in comp_opts}
                     det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in comp_opts}
                 elif comp_opts.pop("rollback", 0):
-                    comp_opts["offload"] = True
+                    # offload=0 is only valid with recall=0 (lightweight variant: nothing to recall)
+                    comp_opts["offload"] = bool(comp_opts.get("offload", 1))
                     rb_opts = {k: comp_opts.pop(k) for k in
                                ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
                                if k in comp_opts}

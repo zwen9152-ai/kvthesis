@@ -45,7 +45,7 @@ def build(model, name, cfg, budget, window, buffer):
     opts.setdefault("window", window)
     rb, det_opts = {}, None
     if opts.pop("rollback", 0):
-        opts["offload"] = True
+        opts["offload"] = bool(opts.get("offload", 1))
         rb = {k: opts.pop(k) for k in ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
               if k in opts}
         det_opts = {k: opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in opts}
@@ -69,6 +69,10 @@ def main():
     ap.add_argument("--window", type=int, default=16)
     ap.add_argument("--buffer", type=int, default=128)
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--dataset", default="math500")
+    ap.add_argument("--ignore_eos", action="store_true",
+                    help="decode exactly max_new_tokens per prompt (memory / long-context stress)")
+    ap.add_argument("--n_per_bs", action="store_true", help="use n = batch size (one full batch per point)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -81,7 +85,9 @@ def main():
     gen_eos = model.generation_config.eos_token_id
     eos = {tok.eos_token_id} | set(gen_eos if isinstance(gen_eos, list) else [gen_eos])
     eos.discard(None)
-    probs = data.load("math500", args.n, 0)
+    if args.ignore_eos:
+        eos = set()
+    probs = data.load(args.dataset, args.n, 0)
     prompts = []
     for p in probs:
         ids = data.build_prompt(tok, p["question"])
@@ -98,15 +104,17 @@ def main():
                     torch.cuda.reset_peak_memory_stats()
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
+                ps = (prompts * (bs // len(prompts) + 1))[:bs] if args.n_per_bs else prompts
                 try:
                     res = [r for _, r in generate_batch(
-                        model, prompts, make_compressor=make_comp, make_detector=make_det, delimiter_ids=delim,
+                        model, ps, make_compressor=make_comp, make_detector=make_det, delimiter_ids=delim,
                         batch_size=bs, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-                        top_p=args.top_p, eos_ids=eos, seeds=list(range(len(prompts))), window=window,
+                        top_p=args.top_p, eos_ids=eos, seeds=list(range(len(ps))), window=window,
                         observe_alpha=observe, **rb)]
                 except torch.cuda.OutOfMemoryError:
                     print(f"{spec} budget={budget} bs={bs}: OOM", flush=True)
-                    rec = {"spec": spec, "budget": budget, "batch_size": bs, "oom": True}
+                    rec = {"spec": spec, "budget": budget, "batch_size": bs, "oom": True,
+                           "max_new_tokens": args.max_new_tokens, "dataset": args.dataset, "ignore_eos": args.ignore_eos}
                     with open(args.out, "a") as f:
                         f.write(json.dumps(rec) + "\n")
                     continue
@@ -116,6 +124,9 @@ def main():
                 computed = sum(r["computed_tokens"] for r in res)
                 rec = {
                     "spec": spec, "budget": budget, "batch_size": bs, "n": len(res), "wall_s": wall,
+                    "max_new_tokens": args.max_new_tokens, "dataset": args.dataset, "ignore_eos": args.ignore_eos,
+                    "peak_gpu_bytes_total": torch.cuda.max_memory_allocated() if device == "cuda" else 0,
+                    "mean_tokens": sum(r["num_tokens"] for r in res) / len(res),
                     "tok_per_s": computed / wall, "computed_tokens": computed,
                     "peak_gpu_bytes_over_weights": (torch.cuda.max_memory_allocated() - weights) if device == "cuda" else 0,
                     "mean_peak_kv_bytes": sum(r["max_cache_bytes"] for r in res) / len(res),
