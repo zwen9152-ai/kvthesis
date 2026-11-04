@@ -93,11 +93,19 @@ def main():
         ids = data.build_prompt(tok, p["question"])
         prompts.append((ids if torch.is_tensor(ids) else ids["input_ids"]).to(device))
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    done = set()  # resume: skip points already in --out
+    if os.path.exists(args.out):
+        for line in open(args.out):
+            r = json.loads(line)
+            done.add((r["spec"], r["budget"], r["batch_size"], r.get("max_new_tokens"), r.get("ignore_eos", False)))
 
     for spec in split_methods(args.specs):
         name, cfg = parse_method(spec)
         for budget in ([None] if name == "full" else [int(b) for b in args.budgets.split(",")]):
             for bs in [int(b) for b in args.batch_sizes.split(",")]:
+                if (spec, budget, bs, args.max_new_tokens, args.ignore_eos) in done:
+                    print(f"{spec} budget={budget} bs={bs}: done, skipped", flush=True)
+                    continue
                 make_comp, make_det, rb, observe, window = build(model, name, cfg, budget, args.window, args.buffer)
                 if device == "cuda":
                     torch.cuda.empty_cache()
