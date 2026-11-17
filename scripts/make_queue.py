@@ -119,7 +119,9 @@ MERGE = "merge=1"  # step-summary merging (chapter 3 prevention), 25% of the bud
 # RewindKV v2: fuzzy + hesitation alarms, graded response (yellow = +50% budget, red = rollback), decay.
 # Defaults until v2dev picks; the forgetting signal joins once ch3 traces give its threshold.
 V2 = "fuzzy=0.6,hesitate=5,graded=1,decay=8"
-FORGET = "offload=1,forget_every=64,forget_thr=0.3"  # placeholder threshold: set from the ch3 traces
+# ch3 traces (2026-11-17): the evicted-attention share rises with output length alike for failing and
+# healthy problems; > 0.5 is roughly an "output > ~5k tokens" trigger. Kept as one ablation.
+FORGET = "offload=1,forget_every=64,forget_thr=0.5"
 
 
 def ch3():

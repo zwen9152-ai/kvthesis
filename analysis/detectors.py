@@ -1,7 +1,7 @@
 """Offline comparison of alarm signals and rules (chapter 4): misses vs. unnecessary alarms.
 
     python -m analysis.detectors results/ch3/1.5b_math500_s0.jsonl results/main/1.5b_math500_s0.jsonl \
-        --runs "snapkv|128,rkv|128,lazy|128" --out results/analysis/detectors.md
+        --runs "snapkv|128;rkv|128;lazy|128" --out results/analysis/detectors.md
 
 Token-based signals (exact / fuzzy step repeats, hesitation) are replayed with the real
 ``DegenerationDetector`` on the saved token ids; the forgetting signal is read from the
@@ -46,7 +46,7 @@ def fire_times(g, delim, kw):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+")
-    ap.add_argument("--runs", required=True, help="comma list of runs to evaluate (plain or observe-only)")
+    ap.add_argument("--runs", required=True, help="';'-separated runs to evaluate (plain or observe-only)")
     ap.add_argument("--tokenizer", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
     ap.add_argument("--fuzzy", type=float, default=0.6)
     ap.add_argument("--hesitate", type=int, default=5)
@@ -64,12 +64,12 @@ def main():
     sig_kw = {"exact": {}, "fuzzy": dict(fuzzy=args.fuzzy, **off),
               "hes": dict(hesitate=args.hesitate, cue_ids=cues, step_repeats=10 ** 9, **off)}
     runs = load(args.files)
-    full = runs.get("full", {})
+    full = runs.get("full") or next((v for k, v in runs.items() if k.startswith("full")), {})
     thrs = [float(x) for x in args.forget_thrs.split(",") if x]
 
     sigs = {}  # (run, id) -> {signal: [times]}
     groups = {}
-    for run in args.runs.split(","):
+    for run in args.runs.split(";"):
         rs = runs.get(run)
         if not rs:
             print(f"(skip {run}: not found)")
