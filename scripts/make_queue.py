@@ -169,6 +169,14 @@ def v2():
     return jobs
 
 
+def curve():
+    """Densify the static cache-accuracy curve where the adaptive runs land (time-avg KV 350-650,
+    between static 256 and 512): budget 384, SnapKV/R-KV first, then LazyEviction/VaSE."""
+    n, maxtok, _, _ = DATA["math500"]
+    return [job(M15, "math500", n, maxtok, 0, "snapkv,rkv", [384]),
+            job(M15, "math500", n, maxtok, 0, "lazy,vase", [384])]
+
+
 def batch_size(j: str, default: int) -> int:
     """Fit a 24 GB GPU: KV per entry is ~28 KB (1.5B) / ~57 KB (7B, plus 15 GB of weights)."""
     a = j.split()
@@ -183,7 +191,7 @@ def batch_size(j: str, default: int) -> int:
     return default
 
 
-PHASES = {"ch3": ch3, "prevent_dev": prevent_dev, "prevent": prevent, "v2dev": v2_dev, "v2": v2,
+PHASES = {"curve": curve, "ch3": ch3, "prevent_dev": prevent_dev, "prevent": prevent, "v2dev": v2_dev, "v2": v2,
           "light": light, "verify": verify, "main": main_15b, "ablation": ablation, "7b": seven_b}
 
 

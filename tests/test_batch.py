@@ -67,7 +67,7 @@ def test_batch_matches_single(model, method, rollback, kw, batch_size):
     batch = run_batch(model, ps, method, rollback, 200, batch_size, **kw)
     for s, b in zip(single, batch):
         assert b["gen_ids"] == s["gen_ids"]
-        for key in ("num_tokens", "computed_tokens", "n_compress", "max_cache_len", "final_budget"):
+        for key in ("num_tokens", "computed_tokens", "n_compress", "max_cache_len", "final_budget", "kv_area"):
             assert b[key] == s[key], key
         assert [r["cut"] for r in b["rollbacks"]] == [r["cut"] for r in s["rollbacks"]]
     if rollback:

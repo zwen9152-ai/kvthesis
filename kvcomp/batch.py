@@ -160,6 +160,7 @@ class _Seq:
         self.interventions = [0]
         self.quiet = 0
         self.computed = 0
+        self.kv_area = 0
         self.max_cache = self.max_offload = 0
         self.logits = None  # next-token logits waiting to be sampled
         self.done = False  # finished by a helper-written EOS
@@ -268,7 +269,7 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             "final_budget": c.budget if c is not None else None,
             "helper_tokens": s.helper.generated if s.helper is not None else 0,
             "helper_max_cache_len": s.helper.max_cache if s.helper is not None else 0,
-            "rollbacks": s.rollbacks, **_extra_stats(c, s.detections, len(s.generated)), "seconds": elapsed, "tok_per_s": s.computed / max(elapsed, 1e-9),
+            "rollbacks": s.rollbacks, "kv_area": s.kv_area, **_extra_stats(c, s.detections, len(s.generated)), "seconds": elapsed, "tok_per_s": s.computed / max(elapsed, 1e-9),
             "batch_size": B,
         }
         seqs[b] = None
@@ -299,6 +300,7 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
     def after_token(b, s, tok, pos, at_boundary):
         """Compression / detection / rollback for slot ``b`` once ``tok`` is cached (cf. decode.generate)."""
         comp, det = s.compressor, s.detector
+        s.kv_area += slots.lens[b]  # resident during this step's attention (before compression)
         if comp is not None:
             comp.append([pos])
             if comp.due(at_boundary):

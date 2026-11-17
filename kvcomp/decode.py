@@ -159,6 +159,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
     detections: list[dict] = []
     interventions = [max_interventions]
     quiet = 0  # reasoning steps since the last rollback (budget decay)
+    kv_area = 0  # sum over decoded steps of resident KV entries (time-averaged KV = kv_area / computed)
     computed = 0  # tokens decoded including those discarded by rollbacks
     max_cache = cache_len(cache)
     max_bytes = cache_bytes(cache)
@@ -173,6 +174,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         at_boundary = tracker.add_token(tok)
         pos = P + len(generated) - 1
         out = _forward(model, cache, [tok], pos)
+        kv_area += cache_len(cache)  # resident during this step's attention (before compression)
         if compressor is not None:
             compressor.on_tokens(cache, [pos], tracker.steps, at_boundary)
             max_offload = max(max_offload, compressor.offloaded_bytes())
@@ -261,6 +263,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         "helper_max_cache_len": helper_state.max_cache if helper_state is not None else 0,
         "final_budget": compressor.budget if compressor is not None else None,
         "rollbacks": rollbacks,
+        "kv_area": kv_area,
         **_extra_stats(compressor, detections, len(generated)),
         "seconds": elapsed,
         "tok_per_s": computed / max(elapsed, 1e-9),
