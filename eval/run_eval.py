@@ -43,6 +43,18 @@ def parse_value(v: str):
     return v
 
 
+DET_KEYS = ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats",
+            "fuzzy", "hesitate", "hesitate_window")
+RB_KEYS = ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget",
+           "act", "intervene", "max_interventions", "max_detections", "decay")
+CUES = ("Wait", "Hmm", "Alternatively", "Hold")
+
+
+def cue_token_ids(tok) -> set[int]:
+    """Tokens that open a reflection step ("Wait", " Wait", "Hmm", ...): hesitation signal."""
+    return {t for t in range(len(tok)) if tok.decode([t]).strip() in CUES}
+
+
 def parse_method(spec: str) -> tuple[str, dict]:
     name, _, rest = spec.partition("@")
     cfg = {}
@@ -139,6 +151,7 @@ def main():
         helper = AutoModelForCausalLM.from_pretrained(args.helper_model, dtype=getattr(torch, args.dtype),
                                                       attn_implementation=args.attn).to(device).eval()
     delim = delimiter_token_ids(tok)
+    cue_ids = cue_token_ids(tok)
     gen_eos = model.generation_config.eos_token_id
     eos = {tok.eos_token_id} | set(gen_eos if isinstance(gen_eos, list) else [gen_eos])
     eos.discard(None)
@@ -177,7 +190,10 @@ def main():
             run = run_key(spec, budget)
             comp_opts, det_opts, rb_opts = None, None, {}
             observe_alpha = None
-            if name != "full":
+            m_name, m_budget = name, budget
+            if name == "full" and cfg:  # Full KV with instrumentation: a compressor that never evicts
+                m_name, m_budget = "snapkv", 10 ** 7
+            if m_name != "full":
                 comp_opts = dict(cfg)
                 if name == "lazy":  # official schedule: evict every W steps, W ~ 0.117 x capacity (MATH)
                     w = int(comp_opts.pop("obs", max(8, round(0.117 * budget))))
@@ -192,14 +208,15 @@ def main():
                         raise SystemExit("rescue=1 needs --helper_model")
                     rb_opts = {k: comp_opts.pop(k) for k in ("max_rollbacks", "max_rewind", "helper_max_step")
                                if k in comp_opts}
-                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in comp_opts}
+                    det_opts = {k: comp_opts.pop(k) for k in DET_KEYS if k in comp_opts}
                 elif comp_opts.pop("rollback", 0):
                     # offload=0 is only valid with recall=0 (lightweight variant: nothing to recall)
                     comp_opts["offload"] = bool(comp_opts.get("offload", 1))
                     rb_opts = {k: comp_opts.pop(k) for k in
-                               ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget")
-                               if k in comp_opts}
-                    det_opts = {k: comp_opts.pop(k) for k in ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats") if k in comp_opts}
+                               RB_KEYS if k in comp_opts}
+                    det_opts = {k: comp_opts.pop(k) for k in DET_KEYS if k in comp_opts}
+                if det_opts and det_opts.get("hesitate"):
+                    det_opts["cue_ids"] = cue_ids
             todo = [(i, prob) for i, prob in enumerate(problems)
                     if i % n_shards == shard and (run, prob["id"]) not in done]
             if not todo:
@@ -214,7 +231,7 @@ def main():
 
             if args.batch_size > 1 or observe_alpha is not None:
                 make_comp = None if comp_opts is None else (
-                    lambda capture: KVCompressor(model, name, budget, capture=capture, **comp_opts))
+                    lambda capture: KVCompressor(model, m_name, m_budget, capture=capture, **comp_opts))
                 make_det = None if det_opts is None else (lambda: DegenerationDetector(**det_opts))
                 make_help = (lambda: HelperState(helper)) if name != "full" and cfg.get("rescue") else None
                 results = generate_batch(model, prompts, make_compressor=make_comp, make_detector=make_det,
@@ -227,7 +244,7 @@ def main():
                     i, prob = todo[j]
                     write(run, name, cfg, budget, i, prob, prompts[j], res)
             else:
-                comp = None if comp_opts is None else KVCompressor(model, name, budget, **comp_opts)
+                comp = None if comp_opts is None else KVCompressor(model, m_name, m_budget, **comp_opts)
                 det = None if det_opts is None else DegenerationDetector(**det_opts)
                 for j, (i, prob) in enumerate(todo):
                     hs = HelperState(helper) if name != "full" and cfg.get("rescue") else None

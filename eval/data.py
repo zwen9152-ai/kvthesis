@@ -24,11 +24,23 @@ def _aime24():
     return [{"id": f"aime24-{r['ID']}", "question": r["Problem"], "answer": str(r["Answer"])} for r in ds]
 
 
-LOADERS = {"gsm8k": _gsm8k, "math500": _math500, "aime24": _aime24}
+def _math500dev():
+    """Tuning split: MATH-500 problems outside the 200-problem main sample (``load(n=200, seed=0)``),
+    in a fixed shuffled order, so hyper-parameters are never chosen on the reported problems."""
+    items = _math500()
+    main = {r["id"] for r in random.Random(0).sample(items, 200)}
+    rest = [r for r in items if r["id"] not in main]
+    random.Random(1).shuffle(rest)
+    return rest
+
+
+LOADERS = {"gsm8k": _gsm8k, "math500": _math500, "aime24": _aime24, "math500dev": _math500dev}
 
 
 def load(name: str, n: int | None = None, seed: int = 0) -> list[dict]:
     items = LOADERS[name]()
+    if name.endswith("dev"):  # already a fixed shuffled order: take the first n
+        return items[:n]
     if n is not None and n < len(items):
         items = random.Random(seed).sample(items, n)
     return items

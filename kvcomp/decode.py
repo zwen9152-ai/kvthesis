@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import torch
 from transformers import DynamicCache
 
-from .cache_utils import cache_bytes, cache_len
+from .cache_utils import cache_bytes, cache_len, get_kv
 from .segment import StepTracker
 
 
@@ -52,6 +52,50 @@ def sample_rows(logits: torch.Tensor, temperature: float, top_p: float, generato
     return torch.cat(draws).tolist()
 
 
+def intervention_positions(comp, mode: str, origin, P: int, generator=None) -> list[int]:
+    """Positions to bring back at a detection (chapter 3 causal test).
+
+    ``aligned``: the first copy of the repeated step; ``random``: as many positions drawn
+    from the other evicted ones (same restore volume); ``none``: nothing.
+    """
+    if mode == "none" or origin is None:
+        return []
+    span = list(range(P + origin[0], P + origin[1]))
+    if mode == "aligned":
+        return span
+    if mode != "random":
+        raise ValueError(f"unknown intervention {mode!r}")
+    if comp.store[0] is None:
+        return []
+    cand = torch.unique(torch.cat([c[0].flatten() for c in comp.store[0]]))
+    cand = cand[(cand < P + origin[0]) | (cand >= P + origin[1])]
+    if not len(cand):
+        return []
+    g = torch.Generator().manual_seed(0) if generator is None or generator.device.type != "cpu" else generator
+    pick = torch.randperm(len(cand), generator=g)[: len(span)]
+    return cand[pick].tolist()
+
+
+def handle_detection(comp, det, tracker, generated, P, loop_start, *, act, intervene, interventions, rng=None,
+                     with_cache=None) -> dict:
+    """Bookkeeping shared by the decoding loops when the detector fires.
+
+    Records the event (and the chapter 3 probe snapshot); in observe mode (``act=False``)
+    optionally runs the causal intervention via ``with_cache(fn)``, which must call
+    ``fn(cache)`` on the sequence's cache and write it back.
+    """
+    ev = {"at": len(generated), "loop_start": loop_start, "kind": det.last_kind,
+          "origin": list(det.last_origin) if det.last_origin else None, "budget": comp.budget}
+    if comp.probe is not None:
+        comp.probe.on_detect(comp, len(generated), P, tracker.ids, ev)
+    if not act and intervene and interventions[0] > 0 and ev["origin"] and comp.n_compress:
+        interventions[0] -= 1
+        want = intervention_positions(comp, intervene, det.last_origin, P, rng)
+        ev["intervene"] = intervene
+        ev["restored"] = with_cache(lambda cache: comp.restore(cache, want)) if want else 0
+    return ev
+
+
 def _forward(model, cache, tokens: list[int], start_pos: int):
     device = model.device
     n, clen = len(tokens), cache_len(cache)
@@ -67,13 +111,24 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
              max_new_tokens: int = 4096, temperature: float = 0.0, top_p: float = 1.0,
              eos_ids=(), seed: int | None = None, max_rollbacks: int = 4, refeed: int = 16,
              max_rewind: int = 512, recall: bool = True, escalate: float = 1.0,
-             max_budget: int = 4096, helper_state=None, helper_max_step: int = 256) -> dict:
+             max_budget: int = 4096, helper_state=None, helper_max_step: int = 256, act: bool = True,
+             intervene: str | None = None, max_interventions: int = 4, max_detections: int = 32,
+             decay: int = 0) -> dict:
     """Generate from ``prompt_ids`` (shape (1, P)); returns token ids and statistics.
 
     With ``escalate > 1`` every rollback multiplies the compressor budget (capped at
     ``max_budget``) before re-selection, so problems that keep looping get more memory.
     With ``helper_state`` (``rescue.HelperState``) a detected loop is handled by the
     KV-Rescue-lite baseline instead: a full-KV helper model rewrites the looping step.
+
+    RewindKV v2 / chapter 3 options:
+      * ``recall="aligned"``: instead of recalling the whole history, only the first copy
+        of the repeated step is brought back from CPU and pinned (needs offload);
+      * ``decay=K``: after K reasoning steps without a new detection an escalated budget
+        steps back down by ``escalate`` (never below the base budget);
+      * ``act=False``: observe only (detections are logged, nothing is rolled back); with
+        ``intervene`` in {aligned, random, none} the first ``max_interventions`` step
+        repeats trigger the chapter 3 causal intervention instead.
     """
     device = model.device
     P = prompt_ids.shape[1]
@@ -82,7 +137,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         generator = torch.Generator(device=device).manual_seed(seed)
     if detector is not None and compressor is None:
         raise ValueError("degeneration handling needs a compressor")
-    if detector is not None and helper_state is None and recall and not compressor.offload:
+    if detector is not None and helper_state is None and act and recall and not compressor.offload:
         raise ValueError("rollback with recall needs a compressor with offload=True")
 
     delimiter_ids = set(delimiter_ids)
@@ -101,6 +156,9 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
 
     generated: list[int] = []
     rollbacks: list[dict] = []
+    detections: list[dict] = []
+    interventions = [max_interventions]
+    quiet = 0  # reasoning steps since the last rollback (budget decay)
     computed = 0  # tokens decoded including those discarded by rollbacks
     max_cache = cache_len(cache)
     max_bytes = cache_bytes(cache)
@@ -120,12 +178,25 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
             max_offload = max(max_offload, compressor.offloaded_bytes())
         max_cache = max(max_cache, cache_len(cache))
         max_bytes = max(max_bytes, cache_bytes(cache))
+        if compressor is not None and compressor.probe is not None:
+            compressor.probe.tick(compressor, len(generated), P, lambda i: get_kv(cache, i)[0])
+        if decay and at_boundary and compressor.budget > compressor.base_budget:
+            quiet += 1
+            if quiet >= decay:
+                compressor.budget = max(compressor.base_budget, int(compressor.budget / max(escalate, 1.0)))
+                quiet = 0
 
-        if detector is None or len(rollbacks) >= max_rollbacks:
+        if detector is None or len(rollbacks) >= max_rollbacks or len(detections) >= max_detections:
             continue
         loop_start = detector.update(generated, at_boundary)
+        if loop_start is None:
+            continue
+        ev = handle_detection(compressor, detector, tracker, generated, P, loop_start, act=act,
+                              intervene=intervene, interventions=interventions, rng=generator,
+                              with_cache=lambda fn: fn(cache))
+        detections.append(ev)
         # A loop before any eviction is the model's own; recall cannot change it.
-        if loop_start is None or compressor.n_compress == 0:
+        if not act or compressor.n_compress == 0:
             continue
         cut = tracker.step_start(P + loop_start)
         if P + loop_start - cut > max_rewind:  # unusually long step: rewind to the loop itself
@@ -145,11 +216,20 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
                 break
             out = SimpleNamespace(logits=logits[None, None])
             continue
+        origin = detector.last_origin
         generated = generated[: cut - P]
         tracker.truncate(cut, generated)
         detector.truncate(generated, lambda t: t in delimiter_ids)
+        if compressor.probe is not None:
+            compressor.probe.truncate(len(generated))
         c0 = max(P, cut - refeed)
-        compressor.rollback(cache, c0, recall=recall)
+        quiet = 0
+        if recall == "aligned":
+            if origin is not None and P + origin[0] < c0:  # entries >= c0 are dropped anyway
+                rollbacks[-1]["restored"] = compressor.restore(cache, range(P + origin[0], min(P + origin[1], c0)))
+            compressor.rollback(cache, c0, recall=False)
+        else:
+            compressor.rollback(cache, c0, recall=recall)
         compressor.budget = min(max_budget, max(compressor.budget, int(compressor.budget * escalate)))
         rollbacks[-1]["budget"] = compressor.budget
         chunk = generated[c0 - P:]
@@ -181,6 +261,23 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         "helper_max_cache_len": helper_state.max_cache if helper_state is not None else 0,
         "final_budget": compressor.budget if compressor is not None else None,
         "rollbacks": rollbacks,
+        **_extra_stats(compressor, detections, len(generated)),
         "seconds": elapsed,
         "tok_per_s": computed / max(elapsed, 1e-9),
     }
+
+
+def _extra_stats(comp, detections, n_gen) -> dict:
+    """Result fields added for chapters 3/4 (empty for runs that use none of the features)."""
+    out = {}
+    if detections:
+        out["detections"] = detections
+    if comp is None:
+        return out
+    if comp.merge:
+        out.update(n_sum=comp.n_sum, n_merged=comp.n_merged, n_empty_groups=comp.n_empty_groups)
+    if comp.n_restored:
+        out["n_restored"] = comp.n_restored
+    if comp.probe is not None:
+        out.update(comp.probe.result(n_gen))
+    return out

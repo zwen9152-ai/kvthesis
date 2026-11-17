@@ -24,7 +24,7 @@ import torch
 from transformers import DynamicCache
 
 from .cache_utils import get_kv, num_layers
-from .decode import _forward, sample_rows
+from .decode import _extra_stats, _forward, handle_detection, sample_rows
 from .query_capture import QueryCapture
 from .segment import StepTracker
 
@@ -156,6 +156,9 @@ class _Seq:
             self.generator = torch.Generator(device=device).manual_seed(seed)
         self.generated: list[int] = []
         self.rollbacks: list[dict] = []
+        self.detections: list[dict] = []
+        self.interventions = [0]
+        self.quiet = 0
         self.computed = 0
         self.max_cache = self.max_offload = 0
         self.logits = None  # next-token logits waiting to be sampled
@@ -170,7 +173,8 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                    top_p: float = 1.0, eos_ids=(), seeds=None, max_rollbacks: int = 4, refeed: int = 16,
                    max_rewind: int = 512, recall: bool = True, escalate: float = 1.0, max_budget: int = 4096,
                    window: int = 16, observe_alpha: float | None = None, debug: dict | None = None,
-                   make_helper=None, helper_max_step: int = 256):
+                   make_helper=None, helper_max_step: int = 256, act: bool = True, intervene: str | None = None,
+                   max_interventions: int = 4, max_detections: int = 32, decay: int = 0):
     """Decode every prompt in ``prompts`` (each (1, P)) and yield ``(index, result)`` as each finishes.
 
     ``make_compressor(capture)`` / ``make_detector()`` build fresh per-problem objects
@@ -221,10 +225,11 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         det = make_detector() if make_detector is not None else None
         if det is not None and comp is None:
             raise ValueError("degeneration handling needs a compressor")
-        if det is not None and make_helper is None and recall and not comp.offload:
+        if det is not None and make_helper is None and act and recall and not comp.offload:
             raise ValueError("rollback with recall needs a compressor with offload=True")
         s = _Seq(idx, prompts[idx], comp, det, delimiter_ids, max_new_tokens,
                  None if seeds is None else seeds[idx], temperature, device)
+        s.interventions = [max_interventions]
         if make_helper is not None:
             s.helper = make_helper()
         if comp is not None:
@@ -263,7 +268,7 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             "final_budget": c.budget if c is not None else None,
             "helper_tokens": s.helper.generated if s.helper is not None else 0,
             "helper_max_cache_len": s.helper.max_cache if s.helper is not None else 0,
-            "rollbacks": s.rollbacks, "seconds": elapsed, "tok_per_s": s.computed / max(elapsed, 1e-9),
+            "rollbacks": s.rollbacks, **_extra_stats(c, s.detections, len(s.generated)), "seconds": elapsed, "tok_per_s": s.computed / max(elapsed, 1e-9),
             "batch_size": B,
         }
         seqs[b] = None
@@ -273,23 +278,23 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         """Hand the observer's per-entry history of slot ``b`` to its compressor (decoded part only)."""
         if observe_alpha is None:
             return
-        n = slots.lens[b]
+        n, o = slots.lens[b], s.P + s.compressor.n_sum  # summaries carry no observer history
         for i in range(n_layers):
             st = s.compressor.state[i]
-            st["lazy_last"] = slots.last[i][b: b + 1, :, s.P:n].clone()
-            st["lazy_mp"] = slots.mp[i][b: b + 1, :, s.P:n].clone()
+            st["lazy_last"] = slots.last[i][b: b + 1, :, o:n].clone()
+            st["lazy_mp"] = slots.mp[i][b: b + 1, :, o:n].clone()
             st["lazy_step"] = float(slots.obs_step[b])
 
     def lazy_from_state(b, s):
         """Write the (re-selected) history back next to the entries it belongs to."""
         if observe_alpha is None:
             return
-        n = slots.lens[b]
+        n, o = slots.lens[b], s.P + s.compressor.n_sum
         for i in range(n_layers):
             st = s.compressor.state[i]
-            if "lazy_last" in st and st["lazy_last"].shape[-1] == n - s.P:
-                slots.last[i][b, :, s.P:n] = st["lazy_last"][0]
-                slots.mp[i][b, :, s.P:n] = st["lazy_mp"][0]
+            if "lazy_last" in st and st["lazy_last"].shape[-1] == n - o:
+                slots.last[i][b, :, o:n] = st["lazy_last"][0]
+                slots.mp[i][b, :, o:n] = st["lazy_mp"][0]
 
     def after_token(b, s, tok, pos, at_boundary):
         """Compression / detection / rollback for slot ``b`` once ``tok`` is cached (cf. decode.generate)."""
@@ -305,10 +310,30 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                 if comp.offload:
                     s.max_offload = max(s.max_offload, comp.offloaded_bytes())
         s.max_cache = max(s.max_cache, slots.lens[b])
-        if det is None or len(s.rollbacks) >= max_rollbacks:
+        if comp is not None and comp.probe is not None:
+            comp.probe.tick(comp, len(s.generated), s.P, lambda i: slots.k[i][b: b + 1, :, : slots.lens[b]])
+        if decay and at_boundary and comp.budget > comp.base_budget:
+            s.quiet += 1
+            if s.quiet >= decay:
+                comp.budget = max(comp.base_budget, int(comp.budget / max(escalate, 1.0)))
+                s.quiet = 0
+        if det is None or len(s.rollbacks) >= max_rollbacks or len(s.detections) >= max_detections:
             return
         loop_start = det.update(s.generated, at_boundary)
-        if loop_start is None or comp.n_compress == 0:
+        if loop_start is None:
+            return
+
+        def with_cache(fn):
+            cache = slots.to_dynamic(b)
+            lazy_to_state(b, s)
+            r = fn(cache)
+            slots.from_dynamic(b, cache)
+            lazy_from_state(b, s)
+            return r
+        s.detections.append(handle_detection(comp, det, s.tracker, s.generated, s.P, loop_start, act=act,
+                                             intervene=intervene, interventions=s.interventions,
+                                             rng=s.generator, with_cache=with_cache))
+        if not act or comp.n_compress == 0:
             return
         P = s.P
         cut = s.tracker.step_start(P + loop_start)
@@ -329,12 +354,22 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             s.max_cache = max(s.max_cache, slots.lens[b])
             s.logits, s.done = logits, logits is None
             return
+        origin = det.last_origin
         s.generated = s.generated[: cut - P]
         s.tracker.truncate(cut, s.generated)
         det.truncate(s.generated, lambda t: t in delimiter_ids)
+        if comp.probe is not None:
+            comp.probe.truncate(len(s.generated))
         c0 = max(P, cut - refeed)
+        s.quiet = 0
         cache = slots.to_dynamic(b)
-        comp.rollback(cache, c0, recall=recall)
+        if recall == "aligned":
+            if origin is not None and P + origin[0] < c0:  # entries >= c0 are dropped anyway
+                lazy_to_state(b, s)
+                s.rollbacks[-1]["restored"] = comp.restore(cache, range(P + origin[0], min(P + origin[1], c0)))
+            comp.rollback(cache, c0, recall=False)
+        else:
+            comp.rollback(cache, c0, recall=recall)
         comp.budget = min(max_budget, max(comp.budget, int(comp.budget * escalate)))
         s.rollbacks[-1]["budget"] = comp.budget
         out = single_forward(b, cache, s.generated[c0 - P:], c0)
