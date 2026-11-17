@@ -286,3 +286,62 @@ def test_probe_compressed_matches_batch(model):
         assert x["gen_ids"] == y["gen_ids"]
         assert x["probe_ret"] == y["probe_ret"]
     assert any(0 <= v < 1000 for r in a for v in r["probe_ret"])
+
+
+# ---------- graded response and forgetting signal ----------
+
+def test_evicted_share_matches_brute_force():
+    from kvcomp.query_capture import evicted_attention_share
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 3, 8)
+    k = torch.randn(1, 2, 10, 8)
+    ke = torch.randn(1, 2, 6, 8)
+    got = evicted_attention_share(q, k, ke, 0.35)
+    shares = []
+    for h in range(4):
+        g = h // 2
+        for j in range(3):
+            lk = (q[0, h, j] @ k[0, g].T) * 0.35
+            lk[10 - 3 + j + 1:] = -float("inf")  # causal inside the window
+            le = (q[0, h, j] @ ke[0, g].T) * 0.35
+            p = torch.cat([lk, le]).softmax(0)
+            shares.append(float(p[10:].sum()))
+    assert abs(got - sum(shares) / len(shares)) < 1e-5
+
+
+def test_graded_first_alarm_is_yellow(model):
+    ps = prompts()
+    kw = {"recall": False, "escalate": 2, "max_budget": 128, "graded": 1, "red_after": 2}
+    a = single(model, ps, offload=False, gen_kw=kw)
+    b = batched(model, ps, offload=False, gen_kw=kw)
+    assert [x["gen_ids"] for x in a] == [x["gen_ids"] for x in b]
+    levels = [e.get("level") for x in a for e in x.get("detections", [])]
+    assert "yellow" in levels and "red" in levels
+    for x in a:  # every red is preceded by a yellow; yellows never roll back
+        evs = [e for e in x.get("detections", []) if e.get("level")]
+        reds = [e for e in evs if e["level"] == "red"]
+        assert len(reds) == len(x["rollbacks"])
+        if evs:
+            assert evs[0]["level"] == "yellow"
+
+
+def test_forgetting_signal_trace_and_alarm(model):
+    ps = prompts()
+    kw = dict(offload=True, forget_every=8, forget_stride=1)
+    a = single(model, ps, gen_kw={"act": False}, **kw)
+    b = batched(model, ps, gen_kw={"act": False}, **kw)
+    for x, y in zip(a, b):
+        assert x["gen_ids"] == y["gen_ids"]
+        assert [t[0] for t in x["forget_trace"]] == [t[0] for t in y["forget_trace"]]
+        assert all(abs(u[1] - v[1]) <= 2 for u, v in zip(x["forget_trace"], y["forget_trace"]))
+    vals = [v for x in a for _, v in x["forget_trace"]]
+    assert vals and all(0 <= v <= 1000 for v in vals)
+    # threshold 0: every measurement is an alarm (once per step) -> forget-kind rollbacks
+    nodet = lambda: DegenerationDetector(min_span=10**9, step_repeats=10**9, check_every=10**9)  # noqa: E731
+    c = single(model, ps, mk_det=nodet, offload=True, forget_every=8, forget_stride=1, forget_thr=0.0,
+               gen_kw={"recall": False, "max_rollbacks": 2})
+    d = batched(model, ps, mk_det=nodet, offload=True, forget_every=8, forget_stride=1, forget_thr=0.0,
+                gen_kw={"recall": False, "max_rollbacks": 2})
+    assert [x["gen_ids"] for x in c] == [x["gen_ids"] for x in d]
+    assert any(e["kind"] == "forget" for x in c for e in x.get("detections", []))
+    assert any(x["rollbacks"] for x in c)

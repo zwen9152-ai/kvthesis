@@ -113,9 +113,13 @@ def light():
 
 
 # ---- chapters 3 / 4 (2026-11 plan) ----
-OBSERVE = "rollback=1,act=0,probe=1"  # detector logs events, nothing is rolled back; chapter 3 probe on
+# detector logs events, nothing is rolled back; chapter 3 probe on; forgetting-signal trace every 64 tokens
+OBSERVE = "rollback=1,act=0,probe=1,forget_every=64"
 MERGE = "merge=1"  # step-summary merging (chapter 3 prevention), 25% of the budget reserved
-V2 = "fuzzy=0.6,hesitate=6,decay=8"  # RewindKV v2 detector + budget decay (defaults until v2dev picks)
+# RewindKV v2: fuzzy + hesitation alarms, graded response (yellow = +50% budget, red = rollback), decay.
+# Defaults until v2dev picks; the forgetting signal joins once ch3 traces give its threshold.
+V2 = "fuzzy=0.6,hesitate=5,graded=1,decay=8"
+FORGET = "offload=1,forget_every=64,forget_thr=0.3"  # placeholder threshold: set from the ch3 traces
 
 
 def ch3():
@@ -156,6 +160,9 @@ def v2_dev():
     base = f"snapkv@{LIGHT}"
     specs = [base, f"{base},fuzzy=0.5", f"{base},fuzzy=0.7", f"{base},hesitate=5", f"{base},hesitate=6",
              f"{base},decay=4", f"{base},decay=8",
+             f"{base},fuzzy=0.6,hesitate=5,graded=1", f"{base},fuzzy=0.6,hesitate=5,graded=1,red_after=3",
+             f"{base},{V2}",
+             f"snapkv@{REWIND},recall=0,{FORGET}", f"snapkv@{REWIND},recall=0,{FORGET},{V2}",
              f"snapkv@{REWIND},recall=aligned"]  # aligned recall + pinning needs the CPU store
     jobs = [job(M15, "math500dev", n, maxtok, 0, s, [128]) for s in specs]
     return [j.replace("results/main/", "results/dev/") for j in jobs]

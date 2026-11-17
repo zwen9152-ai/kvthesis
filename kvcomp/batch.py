@@ -24,7 +24,7 @@ import torch
 from transformers import DynamicCache
 
 from .cache_utils import get_kv, num_layers
-from .decode import _extra_stats, _forward, handle_detection, sample_rows
+from .decode import Controller, _extra_stats, _forward, handle_detection, sample_rows
 from .query_capture import QueryCapture
 from .segment import StepTracker
 
@@ -158,7 +158,7 @@ class _Seq:
         self.rollbacks: list[dict] = []
         self.detections: list[dict] = []
         self.interventions = [0]
-        self.quiet = 0
+        self.ctl = None
         self.computed = 0
         self.kv_area = 0
         self.max_cache = self.max_offload = 0
@@ -175,7 +175,8 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                    max_rewind: int = 512, recall: bool = True, escalate: float = 1.0, max_budget: int = 4096,
                    window: int = 16, observe_alpha: float | None = None, debug: dict | None = None,
                    make_helper=None, helper_max_step: int = 256, act: bool = True, intervene: str | None = None,
-                   max_interventions: int = 4, max_detections: int = 32, decay: int = 0):
+                   max_interventions: int = 4, max_detections: int = 32, decay: int = 0, graded: bool = False,
+                   red_after: int = 2, yellow_boost: float = 1.5, alarm_window: int = 16):
     """Decode every prompt in ``prompts`` (each (1, P)) and yield ``(index, result)`` as each finishes.
 
     ``make_compressor(capture)`` / ``make_detector()`` build fresh per-problem objects
@@ -231,6 +232,7 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         s = _Seq(idx, prompts[idx], comp, det, delimiter_ids, max_new_tokens,
                  None if seeds is None else seeds[idx], temperature, device)
         s.interventions = [max_interventions]
+        s.ctl = Controller(decay, escalate, graded, red_after, yellow_boost, alarm_window, max_budget)
         if make_helper is not None:
             s.helper = make_helper()
         if comp is not None:
@@ -314,14 +316,14 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
         s.max_cache = max(s.max_cache, slots.lens[b])
         if comp is not None and comp.probe is not None:
             comp.probe.tick(comp, len(s.generated), s.P, lambda i: slots.k[i][b: b + 1, :, : slots.lens[b]])
-        if decay and at_boundary and comp.budget > comp.base_budget:
-            s.quiet += 1
-            if s.quiet >= decay:
-                comp.budget = max(comp.base_budget, int(comp.budget / max(escalate, 1.0)))
-                s.quiet = 0
+        s.ctl.on_token(comp, at_boundary)
+        f_start = s.ctl.forget_alarm(comp, len(s.generated), s.P, s.tracker,
+                                     lambda i: slots.k[i][b: b + 1, :, : slots.lens[b]])
         if det is None or len(s.rollbacks) >= max_rollbacks or len(s.detections) >= max_detections:
             return
-        loop_start = det.update(s.generated, at_boundary)
+        loop_start, kind = det.update(s.generated, at_boundary), None
+        if loop_start is None and f_start is not None:
+            loop_start, kind = f_start, "forget"
         if loop_start is None:
             return
 
@@ -334,8 +336,10 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             return r
         s.detections.append(handle_detection(comp, det, s.tracker, s.generated, s.P, loop_start, act=act,
                                              intervene=intervene, interventions=s.interventions,
-                                             rng=s.generator, with_cache=with_cache))
+                                             rng=s.generator, with_cache=with_cache, kind=kind))
         if not act or comp.n_compress == 0:
+            return
+        if not s.ctl.on_alarm(comp, s.detections[-1]):  # yellow warning: more budget, no rollback
             return
         P = s.P
         cut = s.tracker.step_start(P + loop_start)
@@ -356,14 +360,14 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
             s.max_cache = max(s.max_cache, slots.lens[b])
             s.logits, s.done = logits, logits is None
             return
-        origin = det.last_origin
+        origin = s.detections[-1]["origin"]
         s.generated = s.generated[: cut - P]
         s.tracker.truncate(cut, s.generated)
         det.truncate(s.generated, lambda t: t in delimiter_ids)
         if comp.probe is not None:
             comp.probe.truncate(len(s.generated))
         c0 = max(P, cut - refeed)
-        s.quiet = 0
+        s.ctl.on_rollback()
         cache = slots.to_dynamic(b)
         if recall == "aligned":
             if origin is not None and P + origin[0] < c0:  # entries >= c0 are dropped anyway

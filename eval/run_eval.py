@@ -46,7 +46,8 @@ def parse_value(v: str):
 DET_KEYS = ("min_span", "max_period", "min_repeats", "check_every", "min_step_len", "step_repeats",
             "fuzzy", "hesitate", "hesitate_window")
 RB_KEYS = ("max_rollbacks", "refeed", "max_rewind", "recall", "escalate", "max_budget",
-           "act", "intervene", "max_interventions", "max_detections", "decay")
+           "act", "intervene", "max_interventions", "max_detections", "decay",
+           "graded", "red_after", "yellow_boost", "alarm_window")
 CUES = ("Wait", "Hmm", "Alternatively", "Hold")
 
 

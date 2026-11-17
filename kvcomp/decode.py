@@ -77,23 +77,96 @@ def intervention_positions(comp, mode: str, origin, P: int, generator=None) -> l
 
 
 def handle_detection(comp, det, tracker, generated, P, loop_start, *, act, intervene, interventions, rng=None,
-                     with_cache=None) -> dict:
+                     with_cache=None, kind=None) -> dict:
     """Bookkeeping shared by the decoding loops when the detector fires.
 
     Records the event (and the chapter 3 probe snapshot); in observe mode (``act=False``)
     optionally runs the causal intervention via ``with_cache(fn)``, which must call
     ``fn(cache)`` on the sequence's cache and write it back.
     """
-    ev = {"at": len(generated), "loop_start": loop_start, "kind": det.last_kind,
-          "origin": list(det.last_origin) if det.last_origin else None, "budget": comp.budget}
+    origin = None if kind else det.last_origin  # signals other than the detector's carry no origin
+    ev = {"at": len(generated), "loop_start": loop_start, "kind": kind or det.last_kind,
+          "origin": list(origin) if origin else None, "budget": comp.budget}
     if comp.probe is not None:
         comp.probe.on_detect(comp, len(generated), P, tracker.ids, ev)
     if not act and intervene and interventions[0] > 0 and ev["origin"] and comp.n_compress:
         interventions[0] -= 1
-        want = intervention_positions(comp, intervene, det.last_origin, P, rng)
+        want = intervention_positions(comp, intervene, origin, P, rng)
         ev["intervene"] = intervene
         ev["restored"] = with_cache(lambda cache: comp.restore(cache, want)) if want else 0
     return ev
+
+
+class Controller:
+    """Per-problem response policy shared by both decoding loops (RewindKV v2).
+
+    * budget decay (``decay=K``): K reasoning steps without a new alarm step an escalated
+      budget back down by ``escalate`` (never below the base budget);
+    * graded response (``graded=1``): an alarm first raises a *yellow* warning: the budget is
+      multiplied by ``yellow_boost`` without any rollback (a false alarm then only costs a
+      little memory, which decays back). Only the ``red_after``-th alarm within
+      ``alarm_window`` quiet steps escalates to *red*: rollback + escalation as in v1;
+    * forgetting signal (compressor option ``forget_every``): every N tokens the share of
+      attention the recent queries would pay to evicted entries is measured; with
+      ``forget_thr`` a share above it raises an alarm (once per reasoning step) that rolls
+      back to the start of the current step.
+    """
+
+    def __init__(self, decay=0, escalate=1.0, graded=False, red_after=2, yellow_boost=1.5, alarm_window=16,
+                 max_budget=4096):
+        self.decay, self.escalate, self.graded = decay, escalate, bool(graded)
+        self.red_after, self.yellow_boost, self.alarm_window = red_after, yellow_boost, alarm_window
+        self.max_budget = max_budget
+        self.quiet = 0  # steps since the last alarm / rollback (decay)
+        self.calm = 0  # steps since the last alarm (alarm window)
+        self.alarms = 0
+        self.forget_step = -1  # reasoning step of the last forgetting alarm
+
+    def on_token(self, comp, at_boundary):
+        if comp is None or not at_boundary:
+            return
+        if self.decay and comp.budget > comp.base_budget:
+            self.quiet += 1
+            if self.quiet >= self.decay:
+                comp.budget = max(comp.base_budget, int(comp.budget / max(self.escalate, 1.0)))
+                self.quiet = 0
+        if self.graded:
+            self.calm += 1
+            if self.calm >= self.alarm_window:
+                self.alarms = 0
+
+    def forget_alarm(self, comp, n_gen, P, tracker, keys_fn) -> int | None:
+        """Measure the forgetting signal when due; return a loop start (generated index) on alarm."""
+        if comp is None or not comp.forget_every or n_gen % comp.forget_every or not comp.n_compress:
+            return None
+        share = comp.evicted_share(keys_fn)
+        if share is None:
+            return None
+        comp.forget_trace.append([n_gen, round(1000 * share)])
+        step = tracker.ids[P + n_gen - 1]
+        if comp.forget_thr is None or share < comp.forget_thr or step == self.forget_step:
+            return None
+        self.forget_step = step
+        return tracker.step_start(P + n_gen - 1) - P
+
+    def on_alarm(self, comp, ev) -> bool:
+        """Classify an actionable alarm; True means roll back (red / ungraded)."""
+        self.calm = 0
+        if not self.graded:
+            ev["level"] = "red"
+            return True
+        self.alarms += 1
+        if self.alarms < self.red_after:
+            ev["level"] = "yellow"
+            comp.budget = min(self.max_budget, max(comp.budget, int(comp.budget * self.yellow_boost)))
+            self.quiet = 0
+            return False
+        ev["level"] = "red"
+        self.alarms = 0
+        return True
+
+    def on_rollback(self):
+        self.quiet = 0
 
 
 def _forward(model, cache, tokens: list[int], start_pos: int):
@@ -113,7 +186,8 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
              max_rewind: int = 512, recall: bool = True, escalate: float = 1.0,
              max_budget: int = 4096, helper_state=None, helper_max_step: int = 256, act: bool = True,
              intervene: str | None = None, max_interventions: int = 4, max_detections: int = 32,
-             decay: int = 0) -> dict:
+             decay: int = 0, graded: bool = False, red_after: int = 2, yellow_boost: float = 1.5,
+             alarm_window: int = 16) -> dict:
     """Generate from ``prompt_ids`` (shape (1, P)); returns token ids and statistics.
 
     With ``escalate > 1`` every rollback multiplies the compressor budget (capped at
@@ -126,6 +200,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         of the repeated step is brought back from CPU and pinned (needs offload);
       * ``decay=K``: after K reasoning steps without a new detection an escalated budget
         steps back down by ``escalate`` (never below the base budget);
+      * ``graded=1`` / forgetting signal: see ``Controller``;
       * ``act=False``: observe only (detections are logged, nothing is rolled back); with
         ``intervene`` in {aligned, random, none} the first ``max_interventions`` step
         repeats trigger the chapter 3 causal intervention instead.
@@ -158,7 +233,7 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
     rollbacks: list[dict] = []
     detections: list[dict] = []
     interventions = [max_interventions]
-    quiet = 0  # reasoning steps since the last rollback (budget decay)
+    ctl = Controller(decay, escalate, graded, red_after, yellow_boost, alarm_window, max_budget)
     kv_area = 0  # sum over decoded steps of resident KV entries (time-averaged KV = kv_area / computed)
     computed = 0  # tokens decoded including those discarded by rollbacks
     max_cache = cache_len(cache)
@@ -182,23 +257,24 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         max_bytes = max(max_bytes, cache_bytes(cache))
         if compressor is not None and compressor.probe is not None:
             compressor.probe.tick(compressor, len(generated), P, lambda i: get_kv(cache, i)[0])
-        if decay and at_boundary and compressor.budget > compressor.base_budget:
-            quiet += 1
-            if quiet >= decay:
-                compressor.budget = max(compressor.base_budget, int(compressor.budget / max(escalate, 1.0)))
-                quiet = 0
+        ctl.on_token(compressor, at_boundary)
+        f_start = ctl.forget_alarm(compressor, len(generated), P, tracker, lambda i: get_kv(cache, i)[0])
 
         if detector is None or len(rollbacks) >= max_rollbacks or len(detections) >= max_detections:
             continue
-        loop_start = detector.update(generated, at_boundary)
+        loop_start, kind = detector.update(generated, at_boundary), None
+        if loop_start is None and f_start is not None:
+            loop_start, kind = f_start, "forget"
         if loop_start is None:
             continue
         ev = handle_detection(compressor, detector, tracker, generated, P, loop_start, act=act,
                               intervene=intervene, interventions=interventions, rng=generator,
-                              with_cache=lambda fn: fn(cache))
+                              with_cache=lambda fn: fn(cache), kind=kind)
         detections.append(ev)
         # A loop before any eviction is the model's own; recall cannot change it.
         if not act or compressor.n_compress == 0:
+            continue
+        if not ctl.on_alarm(compressor, ev):  # yellow warning: more budget, no rollback
             continue
         cut = tracker.step_start(P + loop_start)
         if P + loop_start - cut > max_rewind:  # unusually long step: rewind to the loop itself
@@ -218,14 +294,14 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
                 break
             out = SimpleNamespace(logits=logits[None, None])
             continue
-        origin = detector.last_origin
+        origin = ev["origin"]
         generated = generated[: cut - P]
         tracker.truncate(cut, generated)
         detector.truncate(generated, lambda t: t in delimiter_ids)
         if compressor.probe is not None:
             compressor.probe.truncate(len(generated))
         c0 = max(P, cut - refeed)
-        quiet = 0
+        ctl.on_rollback()
         if recall == "aligned":
             if origin is not None and P + origin[0] < c0:  # entries >= c0 are dropped anyway
                 rollbacks[-1]["restored"] = compressor.restore(cache, range(P + origin[0], min(P + origin[1], c0)))
@@ -281,6 +357,8 @@ def _extra_stats(comp, detections, n_gen) -> dict:
         out.update(n_sum=comp.n_sum, n_merged=comp.n_merged, n_empty_groups=comp.n_empty_groups)
     if comp.n_restored:
         out["n_restored"] = comp.n_restored
+    if comp.forget_every:
+        out["forget_trace"] = comp.forget_trace
     if comp.probe is not None:
         out.update(comp.probe.result(n_gen))
     return out

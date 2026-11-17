@@ -51,6 +51,10 @@ class KVCompressor:
         self.merge_w = cfg.pop("merge_w", "attn")  # attn | uniform (value weights)
         self.merge_key = cfg.pop("merge_key", "top")  # top | recent (which key represents the step)
         self.pin_frac = float(cfg.pop("pin_frac", 0.25))  # cap on pinned entries (share of budget)
+        self.forget_every = int(cfg.pop("forget_every", 0))  # forgetting signal period (tokens); needs offload
+        self.forget_thr = cfg.pop("forget_thr", None)  # alarm threshold on the evicted-attention share
+        self.forget_thr = None if self.forget_thr is None else float(self.forget_thr)
+        self.forget_stride = int(cfg.pop("forget_stride", 4))  # measure every k-th layer
         self.probe = None
         if cfg.pop("probe", 0):
             from .probe import Probe
@@ -78,6 +82,8 @@ class KVCompressor:
         self.n_merged = 0  # evicted entries folded into summaries (per head, summed over compressions)
         self.n_empty_groups = 0  # (layer, head, step) groups with nothing evicted in that head (fallback used)
         self.n_restored = 0
+        self.forget_trace: list = []  # [generated index, evicted-attention share in per mille]
+        self._ev_keys: dict = {}  # layer -> (chunk count, last chunk id, evicted keys on device)
         if getattr(self, "probe", None) is not None:
             self.probe.reset()
         self.rng = None  # stochastic methods: re-seeded per problem, created on the cache device
@@ -348,6 +354,27 @@ class KVCompressor:
         self.n_restored += int(round(n_new / max(1, num_layers(cache))))
         return int(round(n_new / max(1, num_layers(cache))))
 
+    @torch.no_grad()
+    def evicted_share(self, keys_fn) -> float | None:
+        """Forgetting signal: share of attention the recent window queries would pay to the
+        evicted (offloaded) entries if they were still resident, mean over heads, queries and
+        every ``forget_stride``-th layer. None when nothing has been offloaded."""
+        from .query_capture import evicted_attention_share
+        shares = []
+        for i in range(0, len(self.store), self.forget_stride):
+            chunks = self.store[i]
+            q = self.capture.buf.get(i)
+            if not chunks or q is None:
+                continue
+            k = keys_fn(i)
+            key = (len(chunks), id(chunks[-1]))
+            hit = self._ev_keys.get(i)
+            if hit is None or hit[0] != key:
+                ev = torch.cat([c[1] for c in chunks], dim=-2).to(k.device, non_blocking=True)
+                self._ev_keys[i] = hit = (key, ev)
+            shares.append(evicted_attention_share(q, k, hit[1], self.modules[i].scaling))
+        return float(sum(shares) / len(shares)) if shares else None
+
     def _cap_pins(self):
         """Unpin the oldest pinned positions beyond ``pin_frac * budget`` (same choice in every head)."""
         cap = max(1, int(self.budget * self.pin_frac))
@@ -438,7 +465,10 @@ class KVCompressor:
                    torch.cat([v[:, :, :P], s_v, vd.gather(2, gidx)], dim=2))
             self.pos[i] = torch.cat([s_p, pos.gather(-1, idx)], -1)
             self._sum_cnt[i] = s_c
-            self.store[i] = None
+            # without recall the evicted history before the cut stays evicted: keep those chunks
+            # (forgetting signal, aligned restore); with recall it is back in the cache
+            keep_chunks = [c for c in self.store[i] if bool((c[0] < cut).all())] if (not recall and self.store[i]) else []
+            self.store[i] = keep_chunks or None
             self.state[i] = {}
             if pin is not None:
                 self.state[i]["pin"] = pin.gather(-1, idx)

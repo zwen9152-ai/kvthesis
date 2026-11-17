@@ -90,3 +90,18 @@ def window_attention(q: torch.Tensor, k: torch.Tensor, scaling: float) -> torch.
     kpos = torch.arange(t, device=k.device) - (t - w)
     logits = logits.masked_fill(kpos[None, :] > qpos[:, None], float("-inf"))
     return logits.softmax(-1).sum(2)
+
+
+def evicted_attention_share(q: torch.Tensor, k: torch.Tensor, k_ev: torch.Tensor, scaling: float) -> float:
+    """Share of softmax mass the window queries would put on evicted keys ``k_ev`` (B, Hkv, E, D)
+    if they were attended together with the resident keys ``k`` (same layout as ``window_attention``).
+    Mean over batch, KV heads, query heads of each group and window positions."""
+    bsz, hq, w, d = q.shape
+    hkv, t = k.shape[1], k.shape[2]
+    qg = q.float().reshape(bsz, hkv, (hq // hkv) * w, d)
+    lk = torch.matmul(qg, k.float().transpose(-1, -2)) * scaling
+    qpos = torch.arange(w, device=k.device).repeat(hq // hkv)
+    kpos = torch.arange(t, device=k.device) - (t - w)
+    lk = lk.masked_fill(kpos[None, :] > qpos[:, None], float("-inf"))
+    le = torch.matmul(qg, k_ev.float().transpose(-1, -2)) * scaling  # evicted entries are all older
+    return float(torch.sigmoid(le.logsumexp(-1) - lk.logsumexp(-1)).mean())
