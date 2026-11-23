@@ -345,3 +345,34 @@ def test_forgetting_signal_trace_and_alarm(model):
     assert [x["gen_ids"] for x in c] == [x["gen_ids"] for x in d]
     assert any(e["kind"] == "forget" for x in c for e in x.get("detections", []))
     assert any(x["rollbacks"] for x in c)
+
+
+# ---------- query-guided recall / attention-sized escalation ----------
+
+def test_joint_attention_matches_brute_force():
+    from kvcomp.query_capture import evicted_attention_share, joint_attention
+    torch.manual_seed(1)
+    q, k, ke = torch.randn(1, 4, 3, 8), torch.randn(1, 2, 10, 8), torch.randn(1, 2, 6, 8)
+    pr, pe = joint_attention(q, k, ke, 0.35)
+    assert torch.allclose(pr.sum(-1) + pe.sum(-1), torch.ones(1, 2), atol=1e-5)
+    assert abs(float(pe.sum(-1).mean()) - evicted_attention_share(q, k, ke, 0.35)) < 1e-5
+
+
+@pytest.mark.parametrize("gen_kw,ckw", [
+    ({"recall": "query", "escalate": 2, "max_budget": 64, "refeed": 1}, {"query_frac": 0.5}),
+    ({"recall": False, "escalate": 2, "max_budget": 96}, {"size_cover": 0.9}),
+    ({"recall": False, "escalate": 2, "max_budget": 96, "graded": 1}, {"size_cover": 0.9}),
+])
+def test_query_recall_and_sized_escalation(model, gen_kw, ckw):
+    ps = prompts()
+    a = single(model, ps, offload=True, gen_kw=gen_kw, forget_stride=1, **ckw)
+    b = batched(model, ps, offload=True, gen_kw=gen_kw, forget_stride=1, **ckw)
+    assert [x["gen_ids"] for x in a] == [x["gen_ids"] for x in b]
+    assert [x["final_budget"] for x in a] == [x["final_budget"] for x in b]
+    assert any(x["rollbacks"] for x in a)
+    if gen_kw["recall"] == "query":
+        assert any(r.get("restored", 0) > 0 for x in a for r in x["rollbacks"]), "query recall should restore"
+    if "size_cover" in ckw:
+        dem = [e["demand"] for x in a for e in x["detections"] if e.get("demand") is not None]
+        assert dem and all(d >= 1 for d in dem)
+        assert all(x["final_budget"] <= 96 for x in a)

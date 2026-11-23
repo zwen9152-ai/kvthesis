@@ -55,6 +55,11 @@ class KVCompressor:
         self.forget_thr = cfg.pop("forget_thr", None)  # alarm threshold on the evicted-attention share
         self.forget_thr = None if self.forget_thr is None else float(self.forget_thr)
         self.forget_stride = int(cfg.pop("forget_stride", 4))  # measure every k-th layer
+        # recall="query": at a rollback restore the evicted entries the current queries want most
+        self.query_frac = float(cfg.pop("query_frac", 0.25))  # how many (share of the budget)
+        # size_cover > 0: an alarm sets the budget to the number of decoded entries (resident or
+        # evicted) that cover this share of the window's attention, instead of a fixed multiplier
+        self.size_cover = float(cfg.pop("size_cover", 0))
         self.probe = None
         if cfg.pop("probe", 0):
             from .probe import Probe
@@ -374,6 +379,54 @@ class KVCompressor:
                 self._ev_keys[i] = hit = (key, ev)
             shares.append(evicted_attention_share(q, k, hit[1], self.modules[i].scaling))
         return float(sum(shares) / len(shares)) if shares else None
+
+    def _joint(self, keys_fn):
+        """Per measured layer: (resident attention (B,Hkv,T), evicted positions (B,Hkv,E),
+        evicted attention (B,Hkv,E)) of the current window queries."""
+        from .query_capture import joint_attention
+        for i in range(0, len(self.store), self.forget_stride):
+            chunks = self.store[i]
+            q = self.capture.buf.get(i)
+            if not chunks or q is None:
+                continue
+            k = keys_fn(i)
+            sp = torch.cat([c[0] for c in chunks], dim=-1).to(k.device)
+            ek = torch.cat([c[1] for c in chunks], dim=-2).to(k.device, non_blocking=True)
+            pr, pe = joint_attention(q, k, ek, self.modules[i].scaling)
+            yield i, pr, sp, pe
+
+    @torch.no_grad()
+    def query_positions(self, keys_fn, cut: int, n: int) -> list[int]:
+        """The ``n`` evicted positions below ``cut`` with the most attention from the current
+        window queries (summed over measured layers and KV heads)."""
+        pos, mass = [], []
+        for _, _, sp, pe in self._joint(keys_fn):
+            pos.append(sp.flatten())
+            mass.append(pe.flatten())
+        if not pos or n <= 0:
+            return []
+        pos, mass = torch.cat(pos), torch.cat(mass)
+        ok = pos < cut
+        pos, mass = pos[ok], mass[ok]
+        if not len(pos):
+            return []
+        u, inv = torch.unique(pos, return_inverse=True)
+        tot = torch.zeros(len(u), device=mass.device).index_add_(0, inv, mass)
+        top = tot.topk(min(n, len(u))).indices
+        return sorted(u[top].tolist())
+
+    @torch.no_grad()
+    def attention_demand(self, keys_fn) -> int | None:
+        """Number of decoded entries (resident or evicted) covering ``size_cover`` of the attention
+        the window queries pay to decoded entries; mean over measured layers and KV heads."""
+        P = self.prompt_len
+        need = []
+        for i, pr, _, pe in self._joint(keys_fn):
+            m = torch.cat([pr[..., P:], pe], -1)  # decoded entries only (incl. summaries)
+            m = m / m.sum(-1, keepdim=True).clamp_min(1e-12)
+            cs = m.sort(-1, descending=True).values.cumsum(-1)
+            need.append((cs < self.size_cover).sum(-1).float().add(1).mean())
+        return int(torch.stack(need).mean()) if need else None
 
     def _cap_pins(self):
         """Unpin the oldest pinned positions beyond ``pin_frac * budget`` (same choice in every head)."""

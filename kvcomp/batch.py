@@ -24,7 +24,7 @@ import torch
 from transformers import DynamicCache
 
 from .cache_utils import get_kv, num_layers
-from .decode import Controller, _extra_stats, _forward, handle_detection, sample_rows
+from .decode import Controller, _extra_stats, _forward, escalated_budget, handle_detection, sample_rows
 from .query_capture import QueryCapture
 from .segment import StepTracker
 
@@ -339,6 +339,8 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                                              rng=s.generator, with_cache=with_cache, kind=kind))
         if not act or comp.n_compress == 0:
             return
+        if comp.size_cover:
+            s.detections[-1]["demand"] = comp.attention_demand(lambda i: slots.k[i][b: b + 1, :, : slots.lens[b]])
         if not s.ctl.on_alarm(comp, s.detections[-1]):  # yellow warning: more budget, no rollback
             return
         P = s.P
@@ -374,9 +376,15 @@ def generate_batch(model, prompts, *, make_compressor=None, make_detector=None, 
                 lazy_to_state(b, s)
                 s.rollbacks[-1]["restored"] = comp.restore(cache, range(P + origin[0], min(P + origin[1], c0)))
             comp.rollback(cache, c0, recall=False)
+        elif recall == "query":
+            want = comp.query_positions(lambda i: get_kv(cache, i)[0], c0, int(comp.query_frac * comp.budget))
+            if want:
+                lazy_to_state(b, s)
+                s.rollbacks[-1]["restored"] = comp.restore(cache, want)
+            comp.rollback(cache, c0, recall=False)
         else:
             comp.rollback(cache, c0, recall=recall)
-        comp.budget = min(max_budget, max(comp.budget, int(comp.budget * escalate)))
+        comp.budget = escalated_budget(comp, s.detections[-1], escalate, max_budget)
         s.rollbacks[-1]["budget"] = comp.budget
         out = single_forward(b, cache, s.generated[c0 - P:], c0)
         s.rollbacks[-1]["transient_cache_len"] = get_kv(cache, 0)[0].shape[-2]

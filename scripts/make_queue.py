@@ -170,6 +170,21 @@ def v2_dev():
     return [j.replace("results/main/", "results/dev/") for j in jobs]
 
 
+def resp_dev():
+    """How to respond to an alarm (chapter 4, model-internal): what to recall (query-guided vs.
+    nothing) and how much budget (fixed x1.5 / x2 / x4 vs. sized by the attention demand).
+    v1 exact detector everywhere so only the response differs; static 256/384 = equal-memory refs."""
+    n, maxtok, _, _ = DATA["math500dev"]
+    rw = "rollback=1,max_budget=1024"
+    specs = [f"snapkv@{rw},escalate=2,recall=0,offload=0",  # = LIGHT (reference)
+             f"snapkv@{rw},escalate=1.5,recall=0,offload=0", f"snapkv@{rw},escalate=4,recall=0,offload=0",
+             f"snapkv@{rw},escalate=2,recall=query", f"snapkv@{rw},escalate=2,recall=query,query_frac=0.5",
+             f"snapkv@{rw},escalate=2,recall=0,size_cover=0.9", f"snapkv@{rw},escalate=2,recall=0,size_cover=0.8"]
+    jobs = [job(M15, "math500dev", n, maxtok, 0, s, [128]) for s in specs]
+    jobs.append(job(M15, "math500dev", n, maxtok, 0, "snapkv", [128, 256, 384]))
+    return [j.replace("results/main/", "results/dev/") for j in jobs]
+
+
 def v2():
     """Main table of RewindKV v2 and of v2 + prevention."""
     n, maxtok, _, _ = DATA["math500"]
@@ -200,7 +215,7 @@ def batch_size(j: str, default: int) -> int:
     return default
 
 
-PHASES = {"curve": curve, "ch3": ch3, "prevent_dev": prevent_dev, "prevent": prevent, "v2dev": v2_dev, "v2": v2,
+PHASES = {"curve": curve, "ch3": ch3, "prevent_dev": prevent_dev, "prevent": prevent, "v2dev": v2_dev, "v2": v2, "resp_dev": resp_dev,
           "light": light, "verify": verify, "main": main_15b, "ablation": ablation, "7b": seven_b}
 
 

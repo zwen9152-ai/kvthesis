@@ -92,6 +92,22 @@ def window_attention(q: torch.Tensor, k: torch.Tensor, scaling: float) -> torch.
     return logits.softmax(-1).sum(2)
 
 
+def joint_attention(q: torch.Tensor, k: torch.Tensor, k_ev: torch.Tensor, scaling: float):
+    """Attention the window queries would pay to resident keys ``k`` and evicted keys ``k_ev``
+    together (one softmax), averaged over the query heads of each KV group and the window
+    positions: returns (B, Hkv, T) and (B, Hkv, E), summing to 1 per (B, Hkv)."""
+    bsz, hq, w, d = q.shape
+    hkv, t = k.shape[1], k.shape[2]
+    qg = q.float().reshape(bsz, hkv, (hq // hkv) * w, d)
+    lk = torch.matmul(qg, k.float().transpose(-1, -2)) * scaling
+    qpos = torch.arange(w, device=k.device).repeat(hq // hkv)
+    kpos = torch.arange(t, device=k.device) - (t - w)
+    lk = lk.masked_fill(kpos[None, :] > qpos[:, None], float("-inf"))
+    le = torch.matmul(qg, k_ev.float().transpose(-1, -2)) * scaling
+    p = torch.cat([lk, le], -1).softmax(-1).mean(2)
+    return p[..., :t], p[..., t:]
+
+
 def evicted_attention_share(q: torch.Tensor, k: torch.Tensor, k_ev: torch.Tensor, scaling: float) -> float:
     """Share of softmax mass the window queries would put on evicted keys ``k_ev`` (B, Hkv, E, D)
     if they were attended together with the resident keys ``k`` (same layout as ``window_attention``).

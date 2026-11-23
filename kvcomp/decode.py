@@ -97,6 +97,13 @@ def handle_detection(comp, det, tracker, generated, P, loop_start, *, act, inter
     return ev
 
 
+def escalated_budget(comp, ev, factor, max_budget) -> int:
+    """Budget after an alarm: the attention-sized demand when measured (``size_cover``),
+    otherwise ``factor`` times the current budget; never lower, at most ``max_budget``."""
+    target = ev.get("demand") or int(comp.budget * factor)
+    return min(max_budget, max(comp.budget, int(target)))
+
+
 class Controller:
     """Per-problem response policy shared by both decoding loops (RewindKV v2).
 
@@ -158,7 +165,7 @@ class Controller:
         self.alarms += 1
         if self.alarms < self.red_after:
             ev["level"] = "yellow"
-            comp.budget = min(self.max_budget, max(comp.budget, int(comp.budget * self.yellow_boost)))
+            comp.budget = escalated_budget(comp, ev, self.yellow_boost, self.max_budget)
             self.quiet = 0
             return False
         ev["level"] = "red"
@@ -274,6 +281,8 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
         # A loop before any eviction is the model's own; recall cannot change it.
         if not act or compressor.n_compress == 0:
             continue
+        if compressor.size_cover:
+            ev["demand"] = compressor.attention_demand(lambda i: get_kv(cache, i)[0])
         if not ctl.on_alarm(compressor, ev):  # yellow warning: more budget, no rollback
             continue
         cut = tracker.step_start(P + loop_start)
@@ -306,9 +315,15 @@ def generate(model, prompt_ids: torch.Tensor, *, compressor=None, detector=None,
             if origin is not None and P + origin[0] < c0:  # entries >= c0 are dropped anyway
                 rollbacks[-1]["restored"] = compressor.restore(cache, range(P + origin[0], min(P + origin[1], c0)))
             compressor.rollback(cache, c0, recall=False)
+        elif recall == "query":
+            want = compressor.query_positions(lambda i: get_kv(cache, i)[0], c0,
+                                              int(compressor.query_frac * compressor.budget))
+            if want:
+                rollbacks[-1]["restored"] = compressor.restore(cache, want)
+            compressor.rollback(cache, c0, recall=False)
         else:
             compressor.rollback(cache, c0, recall=recall)
-        compressor.budget = min(max_budget, max(compressor.budget, int(compressor.budget * escalate)))
+        compressor.budget = escalated_budget(compressor, ev, escalate, max_budget)
         rollbacks[-1]["budget"] = compressor.budget
         chunk = generated[c0 - P:]
         out = _forward(model, cache, chunk, c0)
